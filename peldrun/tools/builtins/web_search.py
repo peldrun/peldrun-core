@@ -1,7 +1,7 @@
 """
 PELDRUN Core Web Search Tool.
 Provides asynchronous internet search capabilities for agent information retrieval,
-supporting optional search libraries with lightweight HTTP fallback.
+supporting optional search libraries with lightweight HTTP fallback and hermetic test injection.
 """
 
 from __future__ import annotations
@@ -46,9 +46,15 @@ class WebSearchTool(BaseTool):
     )
     args_schema: Optional[Type[BaseModel]] = WebSearchArgs
 
-    def __init__(self, workspace_root: Optional[str] = None, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        workspace_root: Optional[str] = None,
+        timeout: float = 15.0,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ) -> None:
         super().__init__(workspace_root=workspace_root)
         self.timeout = timeout
+        self._transport = transport
 
     async def _arun(
         self,
@@ -67,28 +73,29 @@ class WebSearchTool(BaseTool):
 
         logger.info("Executing web search for query: '%s' (max_results=%d)", clean_query, max_results)
 
-        # Attempt 1: Try duckduckgo_search package if available
-        try:
-            from duckduckgo_search import DDGS
+        # Attempt 1: Try duckduckgo_search package if available and not mocked
+        if self._transport is None:
+            try:
+                from duckduckgo_search import DDGS
 
-            def _sync_ddgs_search() -> List[Dict[str, str]]:
-                results = []
-                with DDGS() as ddgs:
-                    for item in ddgs.text(clean_query, max_results=max_results):
-                        results.append({
-                            "title": item.get("title", ""),
-                            "url": item.get("href", ""),
-                            "snippet": item.get("body", ""),
-                        })
-                return results
+                def _sync_ddgs_search() -> List[Dict[str, str]]:
+                    results = []
+                    with DDGS() as ddgs:
+                        for item in ddgs.text(clean_query, max_results=max_results):
+                            results.append({
+                                "title": item.get("title", ""),
+                                "url": item.get("href", ""),
+                                "snippet": item.get("body", ""),
+                            })
+                    return results
 
-            items = await asyncio.to_thread(_sync_ddgs_search)
-            if items:
-                return self._format_results(items, clean_query)
-        except ImportError:
-            logger.debug("duckduckgo_search package not installed; falling back to direct HTTP search.")
-        except Exception as ddg_err:
-            logger.warning("duckduckgo_search invocation failed: %s; falling back to HTTP.", ddg_err)
+                items = await asyncio.to_thread(_sync_ddgs_search)
+                if items:
+                    return self._format_results(items, clean_query)
+            except ImportError:
+                logger.debug("duckduckgo_search package not installed; falling back to direct HTTP search.")
+            except Exception as ddg_err:
+                logger.warning("duckduckgo_search invocation failed: %s; falling back to HTTP.", ddg_err)
 
         # Attempt 2: Fallback to direct HTTP search via DuckDuckGo HTML interface
         try:
@@ -124,7 +131,11 @@ class WebSearchTool(BaseTool):
             "Content-Type": "application/x-www-form-urlencoded",
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=True,
+            transport=self._transport,
+        ) as client:
             resp = await client.post(url, data=data, headers=headers)
             resp.raise_for_status()
             html_text = resp.text

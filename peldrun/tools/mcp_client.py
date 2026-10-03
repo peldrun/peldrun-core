@@ -1,7 +1,7 @@
 """
 PELDRUN Core Model Context Protocol (MCP) Client.
 Provides asynchronous JSON-RPC client integration, dynamic MCP tool generation,
-and seamless compatibility with BaseTool and ToolRegistry.
+pluggable transport layers, and seamless compatibility with BaseTool and ToolRegistry.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import uuid
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 import httpx
 from pydantic import BaseModel, Field
@@ -17,6 +18,25 @@ from pydantic import BaseModel, Field
 from peldrun.tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger("peldrun.tools.mcp_client")
+
+
+class BaseMCPTransport(ABC):
+    """Abstract base contract for MCP communication transports."""
+
+    @abstractmethod
+    async def aconnect(self) -> None:
+        """Establish connection to the MCP server."""
+        ...
+
+    @abstractmethod
+    async def asend_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Send a JSON-RPC 2.0 request and return the parsed result."""
+        ...
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Close the transport session and release underlying resources."""
+        ...
 
 
 class MCPToolDefinition(BaseModel):
@@ -70,23 +90,27 @@ class DynamicMCPTool(BaseTool):
 class MCPClient:
     """
     Asynchronous client communicating with an external Model Context Protocol server.
-    Supports tool discovery and invocation over JSON-RPC 2.0.
+    Supports tool discovery and invocation over JSON-RPC 2.0 via HTTP or pluggable transports.
     """
 
     def __init__(
         self,
-        server_url: str,
+        server_url: Optional[str] = None,
         auth_token: Optional[str] = None,
         timeout: float = 30.0,
+        transport: Optional[BaseMCPTransport] = None,
+        http_transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
-        self.server_url = server_url.rstrip("/")
+        self.server_url = server_url.rstrip("/") if server_url else ""
         self.auth_token = auth_token
         self.timeout = timeout
+        self.transport = transport
+        self._http_transport = http_transport
         self._client: Optional[httpx.AsyncClient] = None
         self._lock = asyncio.Lock()
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Lazy-initialize HTTP client session."""
+        """Lazy-initialize HTTP client session for direct HTTP endpoints."""
         async with self._lock:
             if self._client is None or self._client.is_closed:
                 headers = {"Content-Type": "application/json"}
@@ -96,18 +120,24 @@ class MCPClient:
                     base_url=self.server_url,
                     headers=headers,
                     timeout=httpx.Timeout(self.timeout),
+                    transport=self._http_transport,
                 )
             return self._client
 
     async def close(self) -> None:
-        """Release underlying network connections."""
+        """Release underlying network and transport connections."""
         async with self._lock:
+            if self.transport is not None:
+                await self.transport.aclose()
             if self._client is not None and not self._client.is_closed:
                 await self._client.aclose()
                 self._client = None
 
     async def _send_jsonrpc_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Dispatch a JSON-RPC 2.0 compliant request payload."""
+        if self.transport is not None:
+            return await self.transport.asend_request(method, params)
+
         client = await self._get_client()
         request_id = str(uuid.uuid4())
         payload = {
@@ -174,10 +204,9 @@ class MCPClient:
             content_blocks = result.get("content", [])
             is_error = result.get("isError", False)
 
-            # Combine textual responses
             text_outputs: List[str] = []
             for block in content_blocks:
-                if block.get("type") == "text":
+                if isinstance(block, dict) and block.get("type") == "text":
                     text_outputs.append(block.get("text", ""))
                 else:
                     text_outputs.append(json.dumps(block, ensure_ascii=False))

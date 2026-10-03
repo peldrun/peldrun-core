@@ -2,7 +2,7 @@
 PELDRUN Core Tools Subsystem Test Suite.
 Verifies ToolRegistry registration/dispatch, scoped FileOpsTool boundaries,
 ShellExecTool subprocess confinement, HumanInputTool interactive unblocking,
-and DynamicMCPTool schema conversion.
+WebSearchTool resilient parsing, and DynamicMCPTool schema conversion.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any, Dict
+import httpx
 import pytest
 
 from peldrun.events.schema import EventType
@@ -58,7 +59,6 @@ async def test_tool_registry_dispatch(temp_workspace: Path) -> None:
     assert result.exit_code == 0
     assert result.output == "Received: custom_val"
 
-    # Execution failure on missing tool
     missing_result = await registry.aexecute("non_existent_tool")
     assert missing_result.exit_code == 1
     assert missing_result.is_error is True
@@ -123,13 +123,11 @@ async def test_shell_exec_tool_execution_and_cwd(temp_workspace: Path) -> None:
     """Verify command execution, stdout capture, and working directory isolation."""
     tool = ShellExecTool(workspace_root=str(temp_workspace))
 
-    # Basic echo command
     res = await tool.aexecute(command="python -c \"print('Peldrun Shell OK')\"")
     assert res.exit_code == 0
     assert not res.is_error
     assert "Peldrun Shell OK" in res.output
 
-    # Subdirectory containment validation
     sub_dir = temp_workspace / "sub_project"
     sub_dir.mkdir(parents=True, exist_ok=True)
 
@@ -163,6 +161,30 @@ async def test_web_search_tool_empty_query() -> None:
 
 
 @pytest.mark.asyncio
+async def test_web_search_tool_fallback_http_parsing() -> None:
+    """Verify WebSearchTool parses HTML responses into structured results via mock transport."""
+    mock_html = (
+        '<html><body>'
+        '<a class="result__url" href="/l/?uddg=https%3A%2F%2Fpeldrun.dev%2Fdocs"><b>PELDRUN Documentation</b></a>'
+        '<a class="result__snippet" href="#">Autonomous agent framework documentation.</a>'
+        '</body></html>'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=mock_html)
+
+    transport = httpx.MockTransport(handler)
+    tool = WebSearchTool(transport=transport)
+
+    res = await tool.aexecute(query="peldrun docs", max_results=1)
+    assert res.exit_code == 0
+    assert res.is_error is False
+    assert "PELDRUN Documentation" in res.output
+    assert "https://peldrun.dev/docs" in res.output
+    assert len(res.metadata.get("results", [])) == 1
+
+
+@pytest.mark.asyncio
 async def test_human_input_tool_interaction(event_collector: CapturedEventEmitter) -> None:
     """Verify HumanInputTool pauses, emits event, and unblocks upon operator response."""
     tool = HumanInputTool(emitter=event_collector)
@@ -183,7 +205,6 @@ async def test_human_input_tool_interaction(event_collector: CapturedEventEmitte
     assert not res.is_error
     assert res.output == "Operator approved."
 
-    # Verify ask_human event was broadcast
     events = event_collector.get_events_by_type(EventType.ASK_HUMAN.value)
     assert len(events) == 1
     assert events[0].data["question"] == "Proceed with database migration?"
@@ -213,4 +234,3 @@ def test_dynamic_mcp_tool_schema_conversion() -> None:
     assert openai_schema["function"]["description"] == "Search tool provided by MCP server."
     assert "query" in openai_schema["function"]["parameters"]["properties"]
     assert "query" in openai_schema["function"]["parameters"]["required"]
-    
