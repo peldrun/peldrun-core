@@ -12,6 +12,25 @@ license = { text = "Apache-2.0" }
 authors = [
     { name = "PELDRUN Authors and Contributors" }
 ]
+keywords = [
+    "ai-agents",
+    "autonomous-agents",
+    "orchestration",
+    "react-loop",
+    "sse-streaming",
+    "runtime"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "pydantic>=2.0.0",
     "httpx>=0.25.0",
@@ -19,10 +38,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+docker = [
+    "docker>=7.0.0"
+]
 dev = [
     "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0"
+    "pytest-asyncio>=0.21.0",
+    "anyio>=4.0.0",
+    "build>=1.0.0",
+    "twine>=5.0.0"
 ]
+all = [
+    "peldrun-core[docker,dev]"
+]
+
+[project.urls]
+Homepage = "https://github.com/peldrun/peldrun-core"
+Documentation = "https://github.com/peldrun/peldrun-core#readme"
+Repository = "https://github.com/peldrun/peldrun-core.git"
+Issues = "https://github.com/peldrun/peldrun-core/issues"
 
 [project.scripts]
 peldrun = "peldrun.cli:main"
