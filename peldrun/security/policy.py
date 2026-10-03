@@ -62,7 +62,7 @@ def validate_workspace_path(target_path: Path | str, workspace_root: Path | str)
         target_resolved.relative_to(workspace_resolved)
     except ValueError as exc:
         raise SecurityViolationError(
-            f"Path traversal detected: '{target_path}' resolves outside workspace boundary '{workspace_root}'."
+            f"Access denied: Path traversal detected: '{target_path}' resolves outside workspace boundary '{workspace_root}'."
         ) from exc
 
     # Check for sensitive files
@@ -118,13 +118,13 @@ class SecurityPolicy(BaseModel):
     def check_command(self, command: str) -> None:
         """Inspect shell commands for blocked malicious signatures."""
         if not self.allow_shell_exec:
-            raise SecurityViolationError("Shell execution is disabled by security policy.")
+            raise SecurityViolationError("Access denied: Shell execution is disabled by security policy.")
 
         normalized = command.strip()
         for pattern in BLOCKED_COMMAND_PATTERNS:
             if pattern.search(normalized):
                 raise SecurityViolationError(
-                    f"Command execution blocked due to destructive security signature: '{command}'."
+                    f"Access denied: Command execution blocked due to destructive security signature: '{command}'."
                 )
 
     def classify_action(self, tool_name: str, arguments: Dict[str, Any]) -> ActionRiskLevel:
