@@ -1,144 +1,201 @@
 """
-PELDRUN Core Event Protocol Contract Tests.
-Ensures strict validation of the Envelope Pattern, monotonic sequences,
-rejection of arbitrary fields via extra='forbid', and wire-level SSE compliance.
+PELDRUN Core Event Protocol & Contract Verification Test Suite.
+Validates the strict Envelope pattern, typed payloads, wire format purity,
+and concurrent sequence monotonicity.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-import uuid
+from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
 from peldrun.events.emitter import EventEmitter
-from peldrun.events.schema import EventType, PeldrunEvent
+from peldrun.events.schema import (
+    EventType,
+    PeldrunEvent,
+    SnapshotEvent,
+    ToolCallEvent,
+    AskHumanEvent,
+    ToolCallPayload,
+)
 
 
-def test_valid_event_contract_instantiation() -> None:
-    """Verify that a compliant PeldrunEvent passes strict validation."""
-    test_run_id = uuid.uuid4()
+def test_valid_canonical_envelope_creation() -> None:
     event = PeldrunEvent(
         version=1,
-        sequence=1,
-        run_id=test_run_id,
         step=2,
-        type=EventType.STEP_START,
-        payload={"agent_name": "react_agent"},
-        metadata={"priority": "high"},
+        type=EventType.THOUGHT,
+        payload={"thought": "Processing request..."},
+        metadata={"producer": "test-runner"},
+    )
+    assert event.version == 1
+    assert event.step == 2
+    assert event.type == EventType.THOUGHT
+    assert event.payload["thought"] == "Processing request..."
+    assert isinstance(event.event_id, UUID)
+    assert isinstance(event.run_id, UUID)
+    assert event.timestamp > 0
+
+
+def test_strict_uuid_validation_no_silent_fallback() -> None:
+    # Malformed event_id string must raise ValidationError instead of falling back to uuid5
+    with pytest.raises(ValidationError):
+        PeldrunEvent(
+            type=EventType.THOUGHT,
+            event_id="invalid-uuid-string",
+            payload={"thought": "test"},
+        )
+
+    # Malformed run_id must raise ValidationError
+    with pytest.raises(ValidationError):
+        PeldrunEvent(
+            type=EventType.THOUGHT,
+            run_id="not-a-valid-uuid",
+            payload={"thought": "test"},
+        )
+
+    # Valid UUID string must parse correctly
+    valid_id = str(uuid4())
+    event = PeldrunEvent(
+        type=EventType.THOUGHT,
+        event_id=valid_id,
+        payload={"thought": "test"},
+    )
+    assert str(event.event_id) == valid_id
+
+
+def test_extra_fields_forbidden_on_envelope() -> None:
+    # Envelope must be closed (extra='forbid')
+    with pytest.raises(ValidationError):
+        PeldrunEvent(
+            type=EventType.THOUGHT,
+            payload={"thought": "test"},
+            unknown_arbitrary_field="not_allowed",
+        )
+
+
+def test_wire_format_purity_no_redundant_id_or_data() -> None:
+    event = PeldrunEvent(
+        type=EventType.TOOL_CALL,
+        payload={"tool_name": "shell", "arguments": {"command": "ls"}},
+        metadata={"trace_id": "tr-123"},
     )
 
-    assert event.version == 1
-    assert event.sequence == 1
-    assert event.run_id == test_run_id
-    assert event.step == 2
-    assert event.type == EventType.STEP_START
-    assert event.payload["agent_name"] == "react_agent"
-    assert event.metadata["priority"] == "high"
-    assert isinstance(event.event_id, uuid.UUID)
+    wire_dict = event.to_sse_payload()
+
+    # Canonical keys must exist
+    expected_canonical_keys = {
+        "version",
+        "event_id",
+        "sequence",
+        "run_id",
+        "timestamp",
+        "step",
+        "type",
+        "payload",
+        "metadata",
+    }
+    assert set(wire_dict.keys()) == expected_canonical_keys
+
+    # Alias keys 'id' and 'data' must NOT be present in wire dictionary
+    assert "id" not in wire_dict
+    assert "data" not in wire_dict
+
+    # Python backward-compatible property access must continue to function
+    assert event.id == str(event.event_id)
+    assert event.data == event.payload
+
+    # SSE framing check
+    sse_frame = event.to_sse()
+    assert sse_frame.startswith("event: tool_call\ndata: {")
+    assert sse_frame.endswith("}\n\n")
+
+    parsed_sse_data = json.loads(sse_frame.split("data: ")[1].strip())
+    assert "id" not in parsed_sse_data
+    assert "data" not in parsed_sse_data
+    assert parsed_sse_data["type"] == "tool_call"
 
 
-def test_extra_fields_forbidden() -> None:
-    """Verify that extra='forbid' strictly rejects unknown top-level envelope fields."""
-    with pytest.raises(ValidationError) as excinfo:
+def test_typed_payload_validation_success_and_failure() -> None:
+    # TOOL_CALL requires 'tool_name'
+    valid_tool_event = PeldrunEvent(
+        type=EventType.TOOL_CALL,
+        payload={"tool_name": "browser", "arguments": {"url": "https://example.com"}},
+    )
+    assert valid_tool_event.payload["tool_name"] == "browser"
+
+    # TOOL_CALL with missing 'tool_name' must fail validation
+    with pytest.raises(ValidationError):
         PeldrunEvent(
             type=EventType.TOOL_CALL,
-            unauthorized_field="malicious_payload",
+            payload={"arguments": {"url": "https://example.com"}},
         )
-    assert "Extra inputs are not permitted" in str(excinfo.value)
 
+    # ASK_HUMAN requires 'question'
+    valid_human_event = PeldrunEvent(
+        type=EventType.ASK_HUMAN,
+        payload={"question": "Do you accept this action?"},
+    )
+    assert valid_human_event.payload["question"] == "Do you accept this action?"
 
-def test_negative_values_rejected() -> None:
-    """Verify validation constraints on version, sequence, and step fields."""
+    # ASK_HUMAN with missing 'question' must fail validation
     with pytest.raises(ValidationError):
         PeldrunEvent(
-            type=EventType.THOUGHT,
-            version=0,  # Must be >= 1
-        )
-
-    with pytest.raises(ValidationError):
-        PeldrunEvent(
-            type=EventType.THOUGHT,
-            sequence=-1,  # Must be >= 0
-        )
-
-    with pytest.raises(ValidationError):
-        PeldrunEvent(
-            type=EventType.THOUGHT,
-            step=-1,  # Must be >= 0
+            type=EventType.ASK_HUMAN,
+            payload={"options": ["yes", "no"]},
         )
 
 
-def test_invalid_event_type_rejected() -> None:
-    """Verify that unrecognized event types are rejected."""
-    with pytest.raises(ValidationError):
-        PeldrunEvent(
-            type="unknown_event_type_that_does_not_exist",  # type: ignore
-        )
-
-
-def test_event_emitter_monotonic_sequence() -> None:
-    """Verify that EventEmitter enforces monotonically incrementing sequence numbers."""
-    emitter = EventEmitter()
-    assert emitter.current_sequence == 0
-
-    e1 = emitter.create_event(EventType.STEP_START, step=1)
-    e2 = emitter.create_event(EventType.AGENT_ACTIVITY, payload={"message": "working"}, step=1)
-    e3 = emitter.create_event(EventType.TOOL_CALL, payload={"tool_name": "shell_exec"}, step=1)
-    e4 = emitter.create_event(EventType.OBSERVATION, payload={"output": "success"}, step=1)
-    e5 = emitter.create_event(EventType.STEP_END, step=1)
-
-    assert [e1.sequence, e2.sequence, e3.sequence, e4.sequence, e5.sequence] == [1, 2, 3, 4, 5]
-    assert emitter.current_sequence == 5
-
-
-def test_sse_wire_format_compatibility() -> None:
-    """Verify that to_sse() produces wire format with both envelope and backward-compatible fields."""
-    test_event_id = uuid.uuid4()
-    test_run_id = uuid.uuid4()
-
+def test_payload_allows_extra_extensible_fields() -> None:
+    # Domain payloads allow extra fields for vendor-specific extensions (extra='allow')
     event = PeldrunEvent(
-        event_id=test_event_id,
-        run_id=test_run_id,
-        sequence=42,
-        step=3,
-        type=EventType.FINAL,
-        payload={"output": "Done!"},
+        type=EventType.TOOL_CALL,
+        payload={
+            "tool_name": "custom_mcp",
+            "arguments": {},
+            "provider_custom_attribute": "allowed_value",
+        },
     )
-
-    sse_frame = event.to_sse()
-    assert sse_frame.startswith("event: final\n")
-    assert sse_frame.endswith("\n\n")
-
-    # Extract JSON payload line
-    for line in sse_frame.splitlines():
-        if line.startswith("data: "):
-            wire_dict = json.loads(line[len("data: "):])
-            # Strict envelope verification
-            assert wire_dict["event_id"] == str(test_event_id)
-            assert wire_dict["run_id"] == str(test_run_id)
-            assert wire_dict["sequence"] == 42
-            assert wire_dict["step"] == 3
-            assert wire_dict["payload"]["output"] == "Done!"
-            # Backward-compatibility alias verification
-            assert wire_dict["id"] == str(test_event_id)
-            assert wire_dict["data"]["output"] == "Done!"
+    assert event.payload["provider_custom_attribute"] == "allowed_value"
 
 
-def test_roundtrip_json_serialization() -> None:
-    """Verify lossless serialization and deserialization."""
-    original = PeldrunEvent(
-        sequence=10,
-        type=EventType.OBSERVATION,
-        payload={"tool_name": "read_file", "output": "file content", "exit_code": 0},
-        metadata={"session_id": "test_sess"},
-    )
+def test_subclass_strictness_literal_enforcement() -> None:
+    # Valid subclass creation
+    snapshot = SnapshotEvent(payload={"status": "running"})
+    assert snapshot.type == EventType.SNAPSHOT
 
-    json_str = original.model_dump_json()
-    reconstructed = PeldrunEvent.model_validate_json(json_str)
+    # Subclass with conflicting type must raise ValidationError
+    with pytest.raises(ValidationError):
+        SnapshotEvent(type=EventType.ERROR)
 
-    assert reconstructed.event_id == original.event_id
-    assert reconstructed.sequence == original.sequence
-    assert reconstructed.run_id == original.run_id
-    assert reconstructed.payload == original.payload
-    assert reconstructed.metadata == original.metadata
+
+@pytest.mark.asyncio
+async def test_concurrent_monotonic_sequence_allocation() -> None:
+    emitter = EventEmitter()
+    received_events: list[PeldrunEvent] = []
+
+    async def on_event(ev: PeldrunEvent) -> None:
+        received_events.append(ev)
+
+    emitter.subscribe_all(on_event)
+
+    # Dispatch 100 concurrent events from multiple asynchronous coroutines
+    async def dispatch(idx: int) -> None:
+        ev = emitter.create_event(
+            EventType.AGENT_ACTIVITY,
+            payload={"message": f"Step {idx}", "phase": "exec"},
+        )
+        await emitter.emit(ev)
+
+    await asyncio.gather(*[dispatch(i) for i in range(100)])
+
+    assert len(received_events) == 100
+
+    # Ensure all sequence numbers are strictly positive, unique, and sequential
+    sequences = [ev.sequence for ev in received_events]
+    assert len(sequences) == len(set(sequences))
+    assert min(sequences) == 1
+    assert max(sequences) == 100

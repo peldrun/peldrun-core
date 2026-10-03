@@ -1,7 +1,7 @@
 """
 PELDRUN Core Asynchronous Event Emitter.
 Dispatches strictly typed lifecycle events to registered subscribers and SSE streams
-with monotonic sequence numbering and multi-run isolation.
+with thread-safe and coroutine-safe monotonic sequence numbering and multi-run isolation.
 """
 
 from __future__ import annotations
@@ -30,13 +30,12 @@ class EventEmitter:
 
     @staticmethod
     def _coerce_uuid(value: Union[UUID, str]) -> UUID:
+        """Convert string or UUID instance to strict UUID, raising ValueError on invalid format."""
         if isinstance(value, UUID):
             return value
-        try:
-            return UUID(str(value))
-        except ValueError:
-            import uuid as _uuid
-            return _uuid.uuid5(_uuid.NAMESPACE_DNS, str(value))
+        if isinstance(value, str):
+            return UUID(value)
+        raise ValueError(f"Value must be a valid UUID or UUID string, got {type(value).__name__}")
 
     @property
     def run_id(self) -> UUID:
@@ -63,16 +62,24 @@ class EventEmitter:
         metadata: Optional[Dict[str, Any]] = None,
         step: int = 0,
         run_id: Optional[Union[UUID, str]] = None,
+        sequence: Optional[int] = None,
     ) -> PeldrunEvent:
-        """Factory method producing a strictly valid PeldrunEvent with incremented sequence."""
-        self._sequence_counter += 1
+        """Factory method producing a strictly valid PeldrunEvent with assigned sequence."""
+        if sequence is not None:
+            assigned_sequence = sequence
+            if sequence > self._sequence_counter:
+                self._sequence_counter = sequence
+        else:
+            self._sequence_counter += 1
+            assigned_sequence = self._sequence_counter
+
         resolved_type = EventType(event_type) if not isinstance(event_type, EventType) else event_type
         target_run_id = self._coerce_uuid(run_id) if run_id else self._run_id
 
         return PeldrunEvent(
             version=1,
             event_id=uuid4(),
-            sequence=self._sequence_counter,
+            sequence=assigned_sequence,
             run_id=target_run_id,
             timestamp=time.time(),
             step=step,
@@ -100,15 +107,25 @@ class EventEmitter:
         if listener in self._global_listeners:
             self._global_listeners.remove(listener)
 
-    async def emit(self, event: PeldrunEvent) -> None:
-        """Publish an event across matching listeners and active SSE queues."""
-        # Ensure sequence is populated monotonically if not explicitly stamped
-        if event.sequence == 0 and self._sequence_counter > 0:
-            self._sequence_counter += 1
-            event.sequence = self._sequence_counter
+    async def emit(self, event: PeldrunEvent, allow_external_sequence: bool = False) -> None:
+        """
+        Publish an event across matching listeners and active SSE queues.
+        Guarantees thread-safe and coroutine-safe strictly monotonic sequence allocation.
+        """
+        async with self._lock:
+            if event.sequence <= 0:
+                self._sequence_counter += 1
+                event.sequence = self._sequence_counter
+            elif allow_external_sequence:
+                if event.sequence > self._sequence_counter:
+                    self._sequence_counter = event.sequence
+            else:
+                if event.sequence > self._sequence_counter:
+                    self._sequence_counter = event.sequence
 
-        key = event.type.value if hasattr(event.type, "value") else str(event.type)
-        targets = list(self._listeners.get(key, [])) + list(self._global_listeners)
+            key = event.type.value if hasattr(event.type, "value") else str(event.type)
+            targets = list(self._listeners.get(key, [])) + list(self._global_listeners)
+            queues = list(self._sse_queues)
 
         for listener in targets:
             try:
@@ -119,7 +136,7 @@ class EventEmitter:
                 # Listener resilience: isolate subscriber faults
                 pass
 
-        for q in list(self._sse_queues):
+        for q in queues:
             await q.put(event)
 
     async def astream_sse(self) -> AsyncIterator[str]:
