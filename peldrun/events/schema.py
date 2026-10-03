@@ -31,7 +31,7 @@ class EventType(str, Enum):
 class PeldrunEvent(BaseModel):
     """
     Unified public event envelope for all PELDRUN runtime event dispatches.
-    Enforces strict typing and forbids arbitrary top-level fields.
+    Enforces strict typing and forbids arbitrary top-level fields on the core model.
     """
     model_config = ConfigDict(
         extra="forbid",
@@ -89,15 +89,21 @@ class PeldrunEvent(BaseModel):
     def data(self, value: Dict[str, Any]) -> None:
         self.payload = value
 
+    def to_sse_payload(self) -> Dict[str, Any]:
+        """
+        Return serialized JSON-safe dictionary representation with both
+        standard envelope keys and backward-compatible wire aliases.
+        """
+        raw = self.model_dump(mode="json")
+        raw["id"] = str(self.event_id)
+        raw["data"] = self.payload
+        return raw
+
     def to_sse(self) -> str:
         """Serialize event into standard SSE wire protocol frame."""
-        serialized = self.model_dump(mode="json")
+        serialized = self.to_sse_payload()
         event_name = self.type.value if hasattr(self.type, "value") else str(self.type)
         return f"event: {event_name}\ndata: {json.dumps(serialized, ensure_ascii=False)}\n\n"
-
-    def to_sse_payload(self) -> Dict[str, Any]:
-        """Return serialized JSON-safe dictionary representation."""
-        return self.model_dump(mode="json")
 
 
 # Aliases for backward compatibility
