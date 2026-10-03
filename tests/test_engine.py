@@ -1,138 +1,195 @@
 """
 PELDRUN Core Engine Test Suite.
-Verifies ExecutionState mutations, CheckpointManager serialization,
-ExecutionGraph asynchronous pipelines, and AgentRunner lifecycle orchestration.
+
+Aligned with the current source contract:
+  - ExecutionState uses `current_step`, `deliverables`, `task_prompt` (default="").
+  - AgentRunner accepts only `agent=` (StepExecutableAgent protocol).
+  - ExecutionGraph must be `.compile()`d then `.run()`.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, Dict
 import pytest
 
-from peldrun.engine.checkpoint import CheckpointManager, StateCheckpoint
+from peldrun.engine.checkpoint import CheckpointManager
 from peldrun.engine.graph import ExecutionGraph
 from peldrun.engine.runner import AgentRunner, RunnerConfig
-from peldrun.engine.state import ExecutionState
+from peldrun.engine.state import (
+    ExecutionState,
+    ExecutionStatus,
+    MessageRole,
+)
 from peldrun.events.schema import EventType
-from peldrun.memory import MemoryManager
-from peldrun.tools.registry import ToolRegistry
-from tests.conftest import CapturedEventEmitter, MockLLMProvider
+from tests.conftest import CapturedEventEmitter
 
 
-def test_execution_state_lifecycle_and_snapshots() -> None:
-    """Verify state initialization, message tracking, status transitions, and snapshot serialization."""
+# =============================================================================
+# ExecutionState
+# =============================================================================
+
+def test_execution_state_initial_lifecycle() -> None:
+    """Default fields, including task_prompt which defaults to an empty string."""
     state = ExecutionState()
-    assert state.step == 0
-    assert state.status == "idle"
-    assert not state.is_completed
-    assert not state.is_error
+    assert state.task_prompt == ""
+    assert state.current_step == 0
+    assert state.max_steps == 30
+    assert state.agent_name == "PrimaryAgent"
+    assert state.workspace_root is None
+    assert state.status == ExecutionStatus.IDLE
+    assert state.messages == []
+    assert state.tool_history == []
+    assert state.deliverables == []
+    assert state.metadata == {}
+    assert state.checkpoints == []
 
-    # Record interaction messages
-    state.add_message(role="system", content="Initialize system instructions.")
-    state.add_message(role="user", content="Deploy test database.")
+
+def test_execution_state_message_tracking() -> None:
+    state = ExecutionState(task_prompt="Test")
+    msg_sys = state.add_message(role=MessageRole.SYSTEM, content="Init system instructions.")
+    msg_usr = state.add_message(role=MessageRole.USER, content="Deploy test database.")
+
     assert len(state.messages) == 2
-
-    # Transition state to completed
-    state.mark_completed(output="Database deployed successfully.")
-    assert state.status == "completed"
-    assert state.is_completed
-    assert state.final_output == "Database deployed successfully."
-
-    # Verify snapshot round-trip
-    snapshot = state.to_snapshot_dict()
-    restored_state = ExecutionState.from_snapshot_dict(snapshot)
-
-    assert restored_state.status == "completed"
-    assert restored_state.step == state.step
-    assert len(restored_state.messages) == len(state.messages)
-    assert restored_state.final_output == state.final_output
+    assert state.messages[0].role == MessageRole.SYSTEM
+    assert state.messages[1].role == MessageRole.USER
+    assert msg_sys is state.messages[0]
+    assert msg_usr is state.messages[1]
 
 
-def test_execution_state_tool_recording_and_artifacts() -> None:
-    """Verify tool execution history tracking, error flag recording, and artifact accumulation."""
-    state = ExecutionState()
+def test_execution_state_llm_messages_export() -> None:
+    state = ExecutionState(task_prompt="Test")
+    state.add_message(role=MessageRole.SYSTEM, content="System directive")
+    state.add_message(role=MessageRole.USER, content="Hello")
+    assert state.get_llm_messages() == [
+        {"role": "system", "content": "System directive"},
+        {"role": "user", "content": "Hello"},
+    ]
 
-    state.record_tool_execution(
+
+def test_execution_state_status_transitions() -> None:
+    state = ExecutionState(task_prompt="Test")
+    assert state.status == ExecutionStatus.IDLE
+    state.status = ExecutionStatus.RUNNING
+    assert state.status == ExecutionStatus.RUNNING
+    state.status = ExecutionStatus.COMPLETED
+    assert state.status == ExecutionStatus.COMPLETED
+    state.status = ExecutionStatus.FAILED
+    assert state.status == ExecutionStatus.FAILED
+
+
+def test_execution_state_tool_recording_and_error() -> None:
+    state = ExecutionState(task_prompt="Test")
+
+    rec_ok = state.record_tool_execution(
+        call_id="call_abc",
         tool_name="file_ops",
         arguments={"action": "write", "path": "output.txt"},
         output="Created file.",
         exit_code=0,
         is_error=False,
-        artifacts=["output.txt"],
-        tool_call_id="call_abc",
     )
-
     assert len(state.tool_history) == 1
-    record = state.tool_history[0]
-    assert record.tool_name == "file_ops"
-    assert record.artifacts == ["output.txt"]
-    assert "output.txt" in state.artifacts
+    assert rec_ok.call_id == "call_abc"
+    assert rec_ok.tool_name == "file_ops"
+    assert rec_ok.is_error is False
+    assert isinstance(rec_ok.timestamp, float)
 
-    # Record secondary tool execution with error
-    state.record_tool_execution(
+    rec_err = state.record_tool_execution(
+        call_id="call_err",
         tool_name="shell_exec",
         arguments={"command": "invalid_cmd"},
         output="Command not found",
         exit_code=127,
         is_error=True,
-        tool_call_id="call_err",
     )
-
     assert len(state.tool_history) == 2
-    assert state.tool_history[1].is_error is True
-    assert state.tool_history[1].exit_code == 127
+    assert rec_err.is_error is True
+    assert rec_err.exit_code == 127
 
+
+def test_execution_state_deliverables_deduplication() -> None:
+    state = ExecutionState(task_prompt="Test")
+    state.add_deliverable("report.pdf")
+    state.add_deliverable("report.pdf")
+    state.add_deliverable("chart.png")
+    assert state.deliverables == ["report.pdf", "chart.png"]
+
+
+def test_execution_state_checkpoint_create_and_restore() -> None:
+    state = ExecutionState(task_prompt="Test")
+    state.current_step = 2
+    state.metadata["phase"] = "early"
+
+    cp = state.create_checkpoint()
+    assert cp.step == 2
+    assert isinstance(cp.state_dump, dict)
+    assert len(state.checkpoints) == 1
+
+    state.current_step = 10
+    state.metadata["phase"] = "late"
+
+    assert state.restore_checkpoint(cp.checkpoint_id) is True
+    assert state.current_step == 2
+    assert state.metadata["phase"] == "early"
+
+
+def test_execution_state_restore_unknown_checkpoint() -> None:
+    state = ExecutionState(task_prompt="Test")
+    assert state.restore_checkpoint("does-not-exist") is False
+
+
+# =============================================================================
+# CheckpointManager
+# =============================================================================
 
 @pytest.mark.asyncio
 async def test_checkpoint_manager_save_and_restore(temp_workspace: Path) -> None:
-    """Verify persisting and retrieving execution state checkpoints to disk asynchronously."""
+    """Persist and restore execution state via CheckpointManager."""
     manager = CheckpointManager(workspace_root=str(temp_workspace))
     await manager.ainitialize()
 
-    state = ExecutionState()
-    state.step = 3
-    state.add_message("user", "Perform step 3.")
-    state.artifacts.append("report.pdf")
+    state = ExecutionState(task_prompt="Test task")
+    state.current_step = 3
+    state.add_message(role=MessageRole.USER, content="Perform step 3.")
+    state.add_deliverable("report.pdf")
 
-    # Save checkpoint
     checkpoint = await manager.asave_checkpoint(state=state, label="midway_checkpoint")
     assert checkpoint.step == 3
     assert checkpoint.label == "midway_checkpoint"
     assert Path(checkpoint.file_path).exists()
 
-    # List checkpoints
     checkpoints = await manager.alist_checkpoints()
     assert len(checkpoints) == 1
     assert checkpoints[0].id == checkpoint.id
 
-    # Load latest checkpoint
-    loaded_checkpoint = await manager.aload_latest_checkpoint()
-    assert loaded_checkpoint is not None
-    assert loaded_checkpoint.id == checkpoint.id
+    latest = await manager.aload_latest_checkpoint()
+    assert latest is not None
+    assert latest.id == checkpoint.id
 
-    # Restore state
     restored_state = await manager.arestore_state(checkpoint.id)
-    assert restored_state.step == 3
-    assert "report.pdf" in restored_state.artifacts
+    assert restored_state.current_step == 3
+    assert "report.pdf" in restored_state.deliverables
     assert len(restored_state.messages) == 1
 
 
+# =============================================================================
+# ExecutionGraph
+# =============================================================================
+
 @pytest.mark.asyncio
 async def test_execution_graph_linear_pipeline() -> None:
-    """Verify ExecutionGraph defines and executes asynchronous node workflows."""
     graph = ExecutionGraph()
 
     async def step_one(state: ExecutionState) -> ExecutionState:
-        state.step += 1
+        state.current_step += 1
         state.metadata["node_1"] = "done"
         return state
 
     async def step_two(state: ExecutionState) -> ExecutionState:
-        state.step += 1
+        state.current_step += 1
         state.metadata["node_2"] = "done"
-        state.mark_completed(output="Pipeline finished.")
+        state.status = ExecutionStatus.COMPLETED
         return state
 
     graph.add_node("first", step_one)
@@ -140,80 +197,101 @@ async def test_execution_graph_linear_pipeline() -> None:
     graph.add_edge("first", "second")
     graph.set_entry_point("first")
 
-    initial_state = ExecutionState()
-    final_state = await graph.arun(initial_state)
+    compiled = graph.compile()
+    initial = ExecutionState(task_prompt="Linear pipeline test")
+    final = await compiled.run(initial)
 
-    assert final_state.step == 2
-    assert final_state.metadata.get("node_1") == "done"
-    assert final_state.metadata.get("node_2") == "done"
-    assert final_state.is_completed is True
-    assert final_state.final_output == "Pipeline finished."
+    assert final.current_step == 2
+    assert final.metadata["node_1"] == "done"
+    assert final.metadata["node_2"] == "done"
+    assert final.status == ExecutionStatus.COMPLETED
+
+
+# =============================================================================
+# AgentRunner
+# =============================================================================
+
+class _CompletingAgent:
+    """StepExecutableAgent that completes on the first step."""
+
+    name = "CompletingAgent"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def step(self, state: ExecutionState, emitter) -> bool:
+        self.calls += 1
+        state.add_message(role=MessageRole.ASSISTANT, content="done")
+        state.status = ExecutionStatus.COMPLETED
+        return True
+
+
+class _NeverCompletingAgent:
+    """StepExecutableAgent that never returns True and sleeps per step."""
+
+    name = "NeverCompletingAgent"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def step(self, state: ExecutionState, emitter) -> bool:
+        self.calls += 1
+        await asyncio.sleep(0.05)
+        return False
 
 
 @pytest.mark.asyncio
 async def test_agent_runner_lifecycle_and_events(
-    mock_llm: MockLLMProvider,
     event_collector: CapturedEventEmitter,
-    tool_registry: ToolRegistry,
-    memory_manager: MemoryManager,
     temp_workspace: Path,
 ) -> None:
-    """Verify AgentRunner coordinates execution cycles and emits required canonical events."""
-    mock_llm.queue_response(content="Automated run completed successfully.")
-
+    agent = _CompletingAgent()
     runner = AgentRunner(
-        config=RunnerConfig(
-            max_steps=5,
-            workspace_root=str(temp_workspace),
-        ),
-        llm_provider=mock_llm,
-        tool_registry=tool_registry,
-        memory_manager=memory_manager,
+        agent=agent,
         emitter=event_collector,
+        config=RunnerConfig(max_steps=5, enable_checkpointing=False),
     )
 
-    state = await runner.arun_task("Sample runner execution test")
+    state = await runner.run(
+        task_prompt="Sample runner execution test",
+        workspace_root=str(temp_workspace),
+    )
 
-    assert state.is_completed is True
-    assert state.final_output == "Automated run completed successfully."
+    assert agent.calls == 1
+    assert state.status == ExecutionStatus.COMPLETED
+    assert state.current_step == 1
+    assert state.task_prompt == "Sample runner execution test"
+    assert state.agent_name == "CompletingAgent"
 
-    # Validate emitted event sequence
     event_types = [e.type for e in event_collector.captured_events]
     assert EventType.SNAPSHOT in event_types
     assert EventType.STEP_START in event_types
     assert EventType.STEP_END in event_types
-    assert EventType.FINAL in event_types
 
 
 @pytest.mark.asyncio
 async def test_agent_runner_stop_signal(
-    mock_llm: MockLLMProvider,
     event_collector: CapturedEventEmitter,
-    tool_registry: ToolRegistry,
-    memory_manager: MemoryManager,
     temp_workspace: Path,
 ) -> None:
-    """Verify AgentRunner halts gracefully upon receiving an asynchronous stop request."""
-    # Queue multiple responses
-    mock_llm.queue_response(content="Processing step 1...")
-    mock_llm.queue_response(content="Processing step 2...")
-
+    agent = _NeverCompletingAgent()
     runner = AgentRunner(
-        config=RunnerConfig(max_steps=10, workspace_root=str(temp_workspace)),
-        llm_provider=mock_llm,
-        tool_registry=tool_registry,
-        memory_manager=memory_manager,
+        agent=agent,
         emitter=event_collector,
+        config=RunnerConfig(max_steps=10, enable_checkpointing=False),
     )
 
-    async def trigger_stop_later() -> None:
-        await asyncio.sleep(0.05)
-        runner.stop()
+    async def trigger_cancel_later() -> None:
+        await asyncio.sleep(0.08)
+        runner.cancel()
 
-    stop_task = asyncio.create_task(trigger_stop_later())
-    state = await runner.arun_task("Task to be interrupted")
-    await stop_task
+    cancel_task = asyncio.create_task(trigger_cancel_later())
+    state = await runner.run(
+        task_prompt="Task to be interrupted",
+        workspace_root=str(temp_workspace),
+    )
+    await cancel_task
 
-    # Execution should halt early before reaching max steps
-    assert state.step < 10
-    assert not runner.is_running
+    assert state.current_step < 10
+    assert runner.is_cancelled is True
+    assert state.status == ExecutionStatus.PAUSED

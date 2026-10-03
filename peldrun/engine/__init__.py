@@ -1,8 +1,12 @@
 """
 PELDRUN Core Engine Subsystem.
-Exports state models, graph execution primitives, and the agent runner orchestrator.
+Exports state models, graph execution primitives, checkpointing, and the agent runner orchestrator.
 """
 
+from peldrun.engine.checkpoint import (
+    CheckpointManager,
+    StateCheckpoint,
+)
 from peldrun.engine.graph import (
     END,
     START,
@@ -32,6 +36,9 @@ __all__ = [
     "ToolExecutionRecord",
     "Checkpoint",
     "ExecutionState",
+    # Checkpoint subsystem
+    "StateCheckpoint",
+    "CheckpointManager",
     # Graph execution primitives
     "START",
     "END",

@@ -121,7 +121,8 @@ class BaseAgent(ABC):
 
         self._is_running = True
         self._stop_requested = False
-        self._is_paused = False
+        # NOTE: `_is_paused` is intentionally preserved so that a caller may resume a paused agent without resetting the pause state.
+        # call `pause()` *before* `arun()` and have the pause honored.
 
         # Reset or initialize state
         self.state = ExecutionState()

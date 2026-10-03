@@ -84,6 +84,27 @@ class AgentRunner:
         """Check whether pause has been requested."""
         return self._pause_requested.is_set()
 
+    def _build_snapshot_payload(
+        self,
+        state: ExecutionState,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Assemble a snapshot dict matching the EventEmitter.emit_snapshot contract."""
+        metadata: Dict[str, Any] = {
+            "run_id": state.run_id,
+            "max_steps": state.max_steps,
+            "agent_name": state.agent_name,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        return {
+            "status": state.status.value,
+            "step": state.current_step,
+            "agent_name": state.agent_name,
+            "workspace_files": list(state.deliverables),
+            "metadata": metadata,
+        }
+
     async def run(
         self,
         task_prompt: str,
@@ -91,9 +112,7 @@ class AgentRunner:
         workspace_root: Optional[str] = None,
         agent: Optional[StepExecutableAgent] = None,
     ) -> ExecutionState:
-        """
-        Run the agent loop to completion for a given task directive.
-        """
+        """Run the agent loop to completion for a given task directive."""
         active_agent = agent or self.agent
         if active_agent is None:
             raise ValueError("No executable agent provided to AgentRunner.")
@@ -115,28 +134,22 @@ class AgentRunner:
                 state.workspace_root = workspace_root
 
         # Attach run_id to emitter if unassigned
-        if self.emitter.run_id is None:
+        if getattr(self.emitter, "run_id", None) is None:
             self.emitter.run_id = state.run_id
 
         self._cancel_requested.clear()
         self._pause_requested.clear()
         state.status = ExecutionStatus.RUNNING
 
-        # Initial workspace snapshot
-        await self.emitter.emit_snapshot(
-            status=state.status.value,
-            step=state.current_step,
-            agent_name=state.agent_name,
-            workspace_files=state.deliverables,
-            metadata={"run_id": state.run_id, "max_steps": state.max_steps},
-        )
+        # Emit the initial workspace snapshot.
+        await self.emitter.emit_snapshot(self._build_snapshot_payload(state))
 
         global_start_time = time.time()
         is_complete = False
 
         try:
             while state.current_step < self.config.max_steps and not is_complete:
-                # 1. Cancellation Check
+                # 1. Cancellation check
                 if self.is_cancelled:
                     logger.info("Agent run %s cancelled by operator.", state.run_id)
                     state.status = ExecutionStatus.PAUSED
@@ -148,7 +161,7 @@ class AgentRunner:
                     )
                     break
 
-                # 2. Pause Check
+                # 2. Pause check
                 while self.is_paused and not self.is_cancelled:
                     state.status = ExecutionStatus.PAUSED
                     await asyncio.sleep(0.5)
@@ -161,7 +174,7 @@ class AgentRunner:
                 step_index = state.current_step
                 step_start_time = time.time()
 
-                # 3. Global Timeout Check
+                # 3. Global timeout check
                 if (
                     self.config.total_timeout_seconds
                     and (time.time() - global_start_time) > self.config.total_timeout_seconds
@@ -170,14 +183,10 @@ class AgentRunner:
                         f"Global execution timeout reached ({self.config.total_timeout_seconds}s)."
                     )
 
-                # 4. Emit Step Start
-                await self.emitter.emit_step_start(
-                    step=step_index,
-                    agent_name=state.agent_name,
-                    input_prompt=state.task_prompt if step_index == 1 else None,
-                )
+                # 4. Emit step start (aligned with EventEmitter.emit_step_start contract).
+                await self.emitter.emit_step_start(step_number=step_index)
 
-                # 5. Execute Agent Step under step-level timeout
+                # 5. Execute agent step under step-level timeout
                 try:
                     is_complete = await asyncio.wait_for(
                         active_agent.step(state=state, emitter=self.emitter),
@@ -188,21 +197,15 @@ class AgentRunner:
                         f"Step {step_index} exceeded execution timeout of {self.config.step_timeout_seconds}s."
                     )
 
-                elapsed_step = time.time() - step_start_time
-
-                # 6. Periodic Checkpointing
+                # 6. Periodic checkpointing
                 if (
                     self.config.enable_checkpointing
                     and (step_index % self.config.checkpoint_interval == 0)
                 ):
                     state.create_checkpoint()
 
-                # 7. Emit Step End
-                await self.emitter.emit_step_end(
-                    step=step_index,
-                    elapsed_seconds=round(elapsed_step, 3),
-                    success=True,
-                )
+                # 7. Emit step end (aligned with EventEmitter.emit_step_end contract).
+                await self.emitter.emit_step_end(step_number=step_index)
 
             # Post-loop status finalization
             if is_complete:
@@ -230,13 +233,12 @@ class AgentRunner:
             raise
 
         finally:
-            # Emit final status snapshot
+            # Emit the final status snapshot.
             await self.emitter.emit_snapshot(
-                status=state.status.value,
-                step=state.current_step,
-                agent_name=state.agent_name,
-                workspace_files=state.deliverables,
-                metadata={"total_elapsed": round(time.time() - global_start_time, 2)},
+                self._build_snapshot_payload(
+                    state,
+                    extra_metadata={"total_elapsed": round(time.time() - global_start_time, 2)},
+                )
             )
 
         return state

@@ -64,12 +64,12 @@ class DeltaToolCall(BaseModel):
     index: int = Field(default=0)
     id: Optional[str] = Field(default=None)
     name: Optional[str] = Field(default=None)
-    arguments_delta: Optional[str] = Field(default=None)
+    arguments: Optional[str] = Field(default=None)
 
 
 class StreamChunk(BaseModel):
     """Single parsed token or delta fragment from a streaming completion."""
-    content_delta: Optional[str] = Field(default=None)
+    content: Optional[str] = Field(default=None)
     tool_calls: Optional[List[DeltaToolCall]] = Field(default=None)
     finish_reason: Optional[str] = Field(default=None)
     usage: Optional[Dict[str, int]] = Field(default=None)
@@ -273,12 +273,12 @@ class AsyncLLMClient:
                                 index=tc.get("index", 0),
                                 id=tc.get("id"),
                                 name=tc.get("function", {}).get("name") if "function" in tc else None,
-                                arguments_delta=tc.get("function", {}).get("arguments") if "function" in tc else None,
+                                arguments=tc.get("function", {}).get("arguments") if "function" in tc else None,
                             )
                         )
 
                 yield StreamChunk(
-                    content_delta=content_delta,
+                    content=content_delta,
                     tool_calls=parsed_tool_calls,
                     finish_reason=finish_reason,
                     usage=data.get("usage"),

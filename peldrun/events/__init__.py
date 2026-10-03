@@ -1,36 +1,39 @@
 """
-PELDRUN Core Events Subsystem.
-Exports strongly-typed event schemas and the asynchronous event emitter.
+PELDRUN Core Event System Module.
+Exports protocol event schemas and event emitter classes.
 """
 
-from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import (
-    AskHumanEvent,
-    AskHumanPayload,
-    BaseEvent,
-    ErrorEvent,
-    ErrorPayload,
     EventType,
-    FinalEvent,
-    FinalPayload,
-    ObservationEvent,
-    ObservationPayload,
+    BaseEvent,
+    AgentEvent,
     PeldrunEvent,
-    SnapshotEvent,
     SnapshotPayload,
-    StepEndEvent,
-    StepEndPayload,
-    StepStartEvent,
+    SnapshotEvent,
     StepStartPayload,
-    ThoughtEvent,
+    StepStartEvent,
     ThoughtPayload,
-    ToolCallEvent,
+    ThoughtEvent,
     ToolCallPayload,
+    ToolCallEvent,
+    ObservationPayload,
+    ObservationEvent,
+    StepEndPayload,
+    StepEndEvent,
+    FinalPayload,
+    FinalEvent,
+    ErrorPayload,
+    ErrorEvent,
+    AskHumanPayload,
+    AskHumanEvent,
 )
+from peldrun.events.emitter import EventEmitter
 
 __all__ = [
     "EventType",
     "BaseEvent",
+    "AgentEvent",
+    "PeldrunEvent",
     "SnapshotPayload",
     "SnapshotEvent",
     "StepStartPayload",
@@ -49,6 +52,5 @@ __all__ = [
     "ErrorEvent",
     "AskHumanPayload",
     "AskHumanEvent",
-    "PeldrunEvent",
     "EventEmitter",
 ]

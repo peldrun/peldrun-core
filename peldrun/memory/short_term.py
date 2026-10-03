@@ -22,7 +22,7 @@ class ShortTermMemoryConfig(BaseModel):
 
     max_messages: int = Field(
         default=100,
-        ge=5,
+        ge=1,
         description="Maximum number of historical messages retained before pruning"
     )
     max_context_tokens: int = Field(

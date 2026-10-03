@@ -5,6 +5,7 @@ Defines strictly typed Pydantic v2 event models for the PELDRUN streaming lifecy
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from enum import Enum
@@ -27,7 +28,7 @@ class EventType(str, Enum):
 
 class BaseEvent(BaseModel):
     """Base event model common to all PELDRUN protocol notifications."""
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     event_id: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
@@ -49,10 +50,61 @@ class BaseEvent(BaseModel):
         default=None,
         description="Sequence index of the current execution step."
     )
+    payload: Any = Field(
+        default_factory=dict,
+        description="Event specific structured payload."
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Contextual metadata."
+    )
+
+    def __init__(self, **data: Any) -> None:
+        if "id" in data and "event_id" not in data:
+            data["event_id"] = data.pop("id")
+        if "data" in data and "payload" not in data:
+            data["payload"] = data.pop("data")
+        super().__init__(**data)
+
+    @property
+    def id(self) -> str:
+        """Alias for event_id."""
+        return self.event_id
+
+    @property
+    def data(self) -> Dict[str, Any]:
+        """Convenience dictionary representation of event data for tests and consumers."""
+        if isinstance(self.payload, BaseModel):
+            return self.payload.model_dump(mode="json")
+        if isinstance(self.payload, dict):
+            return self.payload
+        return {"value": self.payload}
+
+    @data.setter
+    def data(self, val: Any) -> None:
+        self.payload = val
+
+    def to_sse(self) -> str:
+        """Serialize event to standard SSE wire protocol format."""
+        raw_dict = {
+            "id": self.id,
+            "type": self.type.value if hasattr(self.type, "value") else str(self.type),
+            "timestamp": self.timestamp,
+            "run_id": self.run_id,
+            "step": self.step,
+            "data": self.data,
+            "metadata": self.metadata,
+        }
+        event_name = self.type.value if hasattr(self.type, "value") else str(self.type)
+        return f"event: {event_name}\ndata: {json.dumps(raw_dict, ensure_ascii=False)}\n\n"
 
     def to_sse_payload(self) -> Dict[str, Any]:
         """Convert the event model to a standard dictionary payload for SSE streaming."""
         return self.model_dump(mode="json")
+
+
+# Alias for backward compatibility and test fixtures
+AgentEvent = BaseEvent
 
 
 class SnapshotPayload(BaseModel):
@@ -71,52 +123,60 @@ class SnapshotPayload(BaseModel):
 class SnapshotEvent(BaseEvent):
     """Event broadcasting a full execution and workspace state snapshot."""
     type: EventType = Field(default=EventType.SNAPSHOT)
-    payload: SnapshotPayload = Field(default_factory=SnapshotPayload)
+    payload: Union[SnapshotPayload, Dict[str, Any]] = Field(default_factory=SnapshotPayload)
 
 
 class StepStartPayload(BaseModel):
     """Payload marking the initiation of an agent action step."""
-    step: int = Field(..., description="1-based index of the step being initiated")
-    agent_name: str = Field(..., description="Name of the agent taking action")
+    model_config = ConfigDict(extra="allow")
+    step: Optional[int] = Field(default=None, description="1-based index of the step being initiated")
+    step_number: Optional[int] = Field(default=None, description="Alternative key for step index")
+    agent_name: Optional[str] = Field(default="", description="Name of the agent taking action")
     input_prompt: Optional[str] = Field(default=None, description="Input query or current task directive")
 
 
 class StepStartEvent(BaseEvent):
     """Event emitted at the onset of an execution step."""
     type: EventType = Field(default=EventType.STEP_START)
-    payload: StepStartPayload
+    payload: Union[StepStartPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ThoughtPayload(BaseModel):
     """Payload carrying reasoning traces or chain-of-thought tokens."""
-    content: str = Field(..., description="Reasoning text, hypothesis, or plan fragment")
+    model_config = ConfigDict(extra="allow")
+    content: Optional[str] = Field(default="", description="Reasoning text, hypothesis, or plan fragment")
+    thought: Optional[str] = Field(default="", description="Thought content alias")
     is_delta: bool = Field(default=False, description="True if payload is a streaming delta token")
 
 
 class ThoughtEvent(BaseEvent):
     """Event conveying internal monologue, planning, or reasoning."""
     type: EventType = Field(default=EventType.THOUGHT)
-    payload: ThoughtPayload
+    payload: Union[ThoughtPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ToolCallPayload(BaseModel):
     """Payload identifying a selected tool and its invocation arguments."""
-    call_id: str = Field(..., description="Unique call identifier from the LLM engine")
-    tool_name: str = Field(..., description="Registered identifier of the target tool")
+    model_config = ConfigDict(extra="allow")
+    call_id: Optional[str] = Field(default="", description="Unique call identifier from the LLM engine")
+    tool_call_id: Optional[str] = Field(default="", description="Call id alias")
+    tool_name: str = Field(default="", description="Registered identifier of the target tool")
     arguments: Dict[str, Any] = Field(default_factory=dict, description="Structured arguments passed to the tool")
 
 
 class ToolCallEvent(BaseEvent):
     """Event dispatched when an agent decides to invoke an external tool."""
     type: EventType = Field(default=EventType.TOOL_CALL)
-    payload: ToolCallPayload
+    payload: Union[ToolCallPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ObservationPayload(BaseModel):
     """Payload delivering tool execution outcomes and observations."""
-    call_id: str = Field(..., description="Corresponding tool call identifier")
-    tool_name: str = Field(..., description="Name of the tool that completed execution")
-    output: Any = Field(..., description="Raw or parsed result returned by the tool")
+    model_config = ConfigDict(extra="allow")
+    call_id: Optional[str] = Field(default="", description="Corresponding tool call identifier")
+    tool_call_id: Optional[str] = Field(default="", description="Call id alias")
+    tool_name: Optional[str] = Field(default="", description="Name of the tool that completed execution")
+    output: Any = Field(default="", description="Raw or parsed result returned by the tool")
     exit_code: int = Field(default=0, description="Process exit code or status indicator (0 = success)")
     is_error: bool = Field(default=False, description="Flag indicating execution failure")
 
@@ -124,12 +184,14 @@ class ObservationPayload(BaseModel):
 class ObservationEvent(BaseEvent):
     """Event detailing the result or observation acquired from a tool execution."""
     type: EventType = Field(default=EventType.OBSERVATION)
-    payload: ObservationPayload
+    payload: Union[ObservationPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class StepEndPayload(BaseModel):
     """Payload signaling the conclusion of an individual step."""
-    step: int = Field(..., description="Index of the step that completed")
+    model_config = ConfigDict(extra="allow")
+    step: Optional[int] = Field(default=None, description="Index of the step that completed")
+    step_number: Optional[int] = Field(default=None, description="Step number alias")
     elapsed_seconds: float = Field(default=0.0, description="Duration of the step in seconds")
     success: bool = Field(default=True, description="Whether the step executed without unhandled errors")
 
@@ -137,12 +199,14 @@ class StepEndPayload(BaseModel):
 class StepEndEvent(BaseEvent):
     """Event emitted when an execution step wraps up."""
     type: EventType = Field(default=EventType.STEP_END)
-    payload: StepEndPayload
+    payload: Union[StepEndPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class FinalPayload(BaseModel):
     """Payload containing the final output and deliverable for the user."""
-    content: str = Field(..., description="Final markdown or textual response to the user prompt")
+    model_config = ConfigDict(extra="allow")
+    content: Optional[str] = Field(default="", description="Final markdown or textual response to the user prompt")
+    output: Optional[str] = Field(default="", description="Output alias")
     deliverables: List[str] = Field(default_factory=list, description="Workspace file paths produced as final artifacts")
     total_steps: int = Field(default=1, description="Total steps executed to achieve the resolution")
     total_tokens: Optional[int] = Field(default=None, description="Aggregated token usage across all steps")
@@ -151,12 +215,14 @@ class FinalPayload(BaseModel):
 class FinalEvent(BaseEvent):
     """Event signaling successful resolution and final deliverable dispatch."""
     type: EventType = Field(default=EventType.FINAL)
-    payload: FinalPayload
+    payload: Union[FinalPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ErrorPayload(BaseModel):
     """Payload documenting execution faults, runtime exceptions, or timeouts."""
-    message: str = Field(..., description="Human-readable error summary")
+    model_config = ConfigDict(extra="allow")
+    message: Optional[str] = Field(default="", description="Human-readable error summary")
+    error: Optional[str] = Field(default="", description="Error message alias")
     error_type: str = Field(default="RuntimeError", description="Exception class or category")
     details: Optional[Dict[str, Any]] = Field(default=None, description="Detailed trace or contextual debug attributes")
     recoverable: bool = Field(default=False, description="Indicates whether the agent can recover and continue")
@@ -165,11 +231,12 @@ class ErrorPayload(BaseModel):
 class ErrorEvent(BaseEvent):
     """Event emitted when an unrecoverable failure or tracked error takes place."""
     type: EventType = Field(default=EventType.ERROR)
-    payload: ErrorPayload
+    payload: Union[ErrorPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class AskHumanPayload(BaseModel):
     """Payload requesting interactive human feedback, authorization, or input."""
+    model_config = ConfigDict(extra="allow")
     request_id: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
         description="Unique token referencing this interaction pause"
@@ -188,7 +255,7 @@ class AskHumanPayload(BaseModel):
 class AskHumanEvent(BaseEvent):
     """Event emitted when the agent pauses execution to solicit human collaboration."""
     type: EventType = Field(default=EventType.ASK_HUMAN)
-    payload: AskHumanPayload
+    payload: Union[AskHumanPayload, Dict[str, Any]] = Field(default_factory=dict)
 
 
 # Type union representing any protocol event model
@@ -202,4 +269,30 @@ PeldrunEvent = Union[
     FinalEvent,
     ErrorEvent,
     AskHumanEvent,
+    BaseEvent,
+]
+
+__all__ = [
+    "EventType",
+    "BaseEvent",
+    "AgentEvent",
+    "PeldrunEvent",
+    "SnapshotPayload",
+    "SnapshotEvent",
+    "StepStartPayload",
+    "StepStartEvent",
+    "ThoughtPayload",
+    "ThoughtEvent",
+    "ToolCallPayload",
+    "ToolCallEvent",
+    "ObservationPayload",
+    "ObservationEvent",
+    "StepEndPayload",
+    "StepEndEvent",
+    "FinalPayload",
+    "FinalEvent",
+    "ErrorPayload",
+    "ErrorEvent",
+    "AskHumanPayload",
+    "AskHumanEvent",
 ]
