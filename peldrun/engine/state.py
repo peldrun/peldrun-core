@@ -156,6 +156,21 @@ class ExecutionState(BaseModel):
         self.updated_at = time.time()
 
     @property
+    def output(self) -> Optional[str]:
+        """Backward-compatible alias for `final_output`."""
+        return self.final_output
+
+    @output.setter
+    def output(self, value: Optional[str]) -> None:
+        self.final_output = value
+        self.updated_at = time.time()
+
+    @property
+    def tool_calls(self) -> List[ToolExecutionRecord]:
+        """Backward-compatible alias for `tool_history`."""
+        return self.tool_history
+
+    @property
     def artifacts(self) -> List[str]:
         """Backward-compatible alias for `deliverables`."""
         return self.deliverables

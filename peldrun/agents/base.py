@@ -68,6 +68,11 @@ class BaseAgent(ABC):
         self._step_lock = asyncio.Lock()
 
     @property
+    def name(self) -> str:
+        """Agent identifier string conforming to StepExecutableAgent."""
+        return self.config.name
+
+    @property
     def is_running(self) -> bool:
         """True if the agent execution loop is actively progressing."""
         return self._is_running
@@ -111,6 +116,47 @@ class BaseAgent(ABC):
         """
         ...
 
+    async def step(
+        self,
+        state: Optional[ExecutionState] = None,
+        emitter: Optional[EventEmitter] = None,
+    ) -> bool:
+        """
+        Execute a single reasoning/action iteration conforming to StepExecutableAgent Protocol.
+        Synchronizes state, emitter, and memory context, then executes _astep().
+        Returns True if the task has reached completion, False to continue iterating.
+        """
+        if state is not None:
+            self.state = state
+        if emitter is not None:
+            self.emitter = emitter
+
+        # Synchronize short-term memory dialogue from state if needed
+        if hasattr(self, "memory") and hasattr(self.memory, "short_term"):
+            if not self.memory.short_term.messages and self.state.messages:
+                for msg in self.state.messages:
+                    self.memory.short_term.add_message(
+                        role=msg.role.value if hasattr(msg.role, "value") else str(msg.role),
+                        content=msg.content,
+                        name=msg.name,
+                        tool_calls=msg.tool_calls,
+                        tool_call_id=msg.tool_call_id,
+                    )
+
+        async with self._step_lock:
+            should_continue = await self._astep()
+
+        is_done = (not should_continue) or self.state.is_completed
+
+        # Guarantee final event broadcast upon conclusion
+        if is_done and self.state.is_completed:
+            await self.emitter.emit_final(
+                output=self.state.final_output or "Task finished.",
+                step=self.state.current_step,
+            )
+
+        return is_done
+
     async def arun(self, task: str, **kwargs: Any) -> ExecutionState:
         """
         Main asynchronous execution entrypoint.
@@ -121,8 +167,6 @@ class BaseAgent(ABC):
 
         self._is_running = True
         self._stop_requested = False
-        # NOTE: `_is_paused` is intentionally preserved so that a caller may resume a paused agent without resetting the pause state.
-        # call `pause()` *before* `arun()` and have the pause honored.
 
         # Reset or initialize state
         self.state = ExecutionState()
