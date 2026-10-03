@@ -1,7 +1,7 @@
 """
 PELDRUN Core Scoped Shell Execution Tool.
 Executes terminal commands asynchronously with strict working-directory confinement,
-timeout controls, and structured output capture.
+timeout controls, structured output capture, and command governance via SecurityPolicy.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Type
 from pydantic import BaseModel, Field
 
+from peldrun.security.policy import SecurityPolicy, SecurityViolationError
 from peldrun.tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger("peldrun.tools.builtins.shell_exec")
@@ -40,15 +41,29 @@ class ShellExecArgs(BaseModel):
 class ShellExecTool(BaseTool):
     """
     Core tool for running shell commands confined to the project workspace.
-    Captures stdout, stderr, process return codes, and enforces strict execution boundaries.
+    Captures stdout, stderr, process return codes, and enforces strict execution boundaries
+    and malicious command blocking via SecurityPolicy.
     """
 
     name: str = "shell_exec"
     description: str = (
         "Execute shell commands securely within the bounded project workspace directory. "
-        "Captures stdout, stderr, and process exit codes with timeout protection."
+        "Captures stdout, stderr, and process exit codes with timeout and policy protection."
     )
     args_schema: Optional[Type[BaseModel]] = ShellExecArgs
+
+    def __init__(
+        self,
+        workspace_root: Optional[str] = None,
+        security_policy: Optional[SecurityPolicy] = None,
+    ) -> None:
+        super().__init__(workspace_root=workspace_root)
+        if security_policy:
+            self.security_policy = security_policy
+        elif workspace_root:
+            self.security_policy = SecurityPolicy(workspace_root=Path(workspace_root).resolve())
+        else:
+            self.security_policy = SecurityPolicy()
 
     def _resolve_working_directory(self, subdir: Optional[str]) -> Path:
         """
@@ -65,10 +80,8 @@ class ShellExecTool(BaseTool):
             return root
 
         target = (root / subdir.strip().lstrip("/\\")).resolve()
-        if root != target and root not in target.parents:
-            raise PermissionError(
-                f"Access denied: Working subdirectory '{subdir}' escapes workspace boundary '{root}'."
-            )
+        # Enforce path containment via SecurityPolicy
+        self.security_policy.check_path_access(target)
 
         if not target.exists():
             target.mkdir(parents=True, exist_ok=True)
@@ -82,15 +95,27 @@ class ShellExecTool(BaseTool):
         timeout_seconds: float = 60.0,
         **kwargs: Any,
     ) -> ToolResult:
-        """Execute command asynchronously with timeout and output capture."""
+        """Execute command asynchronously with timeout, output capture, and security policy checks."""
+        # 1. Enforce command signature checks
+        try:
+            self.security_policy.check_command(command)
+        except SecurityViolationError as sec_err:
+            return ToolResult(
+                output=str(sec_err),
+                exit_code=1,
+                is_error=True,
+                metadata={"error_type": "SecurityViolationError"},
+            )
+
+        # 2. Resolve working directory safely
         try:
             cwd_path = self._resolve_working_directory(working_subdir)
-        except PermissionError as perm_err:
+        except (PermissionError, SecurityViolationError) as perm_err:
             return ToolResult(
                 output=str(perm_err),
                 exit_code=1,
                 is_error=True,
-                metadata={"error_type": "PermissionError"},
+                metadata={"error_type": type(perm_err).__name__},
             )
 
         logger.debug("Executing shell command: '%s' in cwd: '%s'", command, cwd_path)

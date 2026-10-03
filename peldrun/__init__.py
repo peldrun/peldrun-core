@@ -22,6 +22,12 @@ from peldrun.engine.state import ExecutionState
 from peldrun.events.emitter import EventEmitter
 from peldrun.sandbox.base import BaseSandbox
 from peldrun.sandbox.local_process import LocalProcessSandbox
+from peldrun.security.policy import (
+    ActionRiskLevel,
+    SecurityPolicy,
+    SecurityViolationError,
+    validate_workspace_path,
+)
 from peldrun.tools.base import BaseTool, ToolResult
 from peldrun.tools.registry import ToolRegistry
 
@@ -79,6 +85,11 @@ __all__: List[str] = [
     "PeldrunEvent",
     "EventType",
     "EventEmitter",
+    # Security & Governance
+    "SecurityPolicy",
+    "SecurityViolationError",
+    "ActionRiskLevel",
+    "validate_workspace_path",
     # Tools Subsystem
     "BaseTool",
     "ToolResult",

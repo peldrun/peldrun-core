@@ -1,9 +1,3 @@
-بصفتي المشرف التقني والمدير الهندسي لمشروع **peldrun-core**، تم إعداد **دليل المطورين والتوثيق المعماري الشامل (Technical Architecture & Developer Manual)** باللغة الإنجليزية التقنية الصارمة وفق أرقى معايير توثيق المشاريع مفتوحة المصدر (Enterprise Open-Source Standards).
-
-هذا التوثيق مصمم ليكون المرجع الأساسي لأي مهندس برمجيات ينضم إلى المشروع؛ حيث يشرح فلسفة التصميم، وتدفق البيانات، والعقود البرمجية للأنظمة الفرعية السبعة، وكيفية إضافة وكلاء وأدوات ومزودات نماذج جديدة مع الحفاظ على استقرار الاختبارات الـ 79 بنسبة 100%.
-
----
-
 # 📘 PELDRUN Core — Developer & Technical Architecture Manual
 
 ```markdown
@@ -465,8 +459,6 @@ python -m pytest tests/ -v
 * `tests/test_cli.py`: 7 tests (CLI argument parsing, subcommands: version, tools, check, run success/error)
 
 **Total:** **79 passed in ~6.08s (100% pass rate).**
+ 
 
-```
-
----
 

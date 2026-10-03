@@ -1,6 +1,7 @@
 """
 PELDRUN Core Scoped File Operations Tool.
-Provides safe, isolated filesystem interactions strictly bounded within the project workspace.
+Provides safe, isolated filesystem interactions strictly bounded within the project workspace
+and governed by the declarative SecurityPolicy engine.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Type
 from pydantic import BaseModel, Field
 
+from peldrun.security.policy import SecurityPolicy, SecurityViolationError
 from peldrun.tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger("peldrun.tools.builtins.file_ops")
@@ -40,7 +42,7 @@ class FileOpsArgs(BaseModel):
 class FileOpsTool(BaseTool):
     """
     Core tool for performing secure, sandboxed file operations.
-    Enforces path containment within the designated workspace directory.
+    Enforces strict path containment and sensitive file jailing via SecurityPolicy.
     """
 
     name: str = "file_ops"
@@ -52,10 +54,23 @@ class FileOpsTool(BaseTool):
     )
     args_schema: Optional[Type[BaseModel]] = FileOpsArgs
 
+    def __init__(
+        self,
+        workspace_root: Optional[str] = None,
+        security_policy: Optional[SecurityPolicy] = None,
+    ) -> None:
+        super().__init__(workspace_root=workspace_root)
+        if security_policy:
+            self.security_policy = security_policy
+        elif workspace_root:
+            self.security_policy = SecurityPolicy(workspace_root=Path(workspace_root).resolve())
+        else:
+            self.security_policy = SecurityPolicy()
+
     def _resolve_safe_path(self, rel_path: str) -> Path:
         """
-        Resolve relative path against workspace root and verify strict containment.
-        Prevents directory traversal vulnerabilities.
+        Resolve path against workspace root and verify strict containment via SecurityPolicy.
+        Prevents path traversal and sensitive file access attacks.
         """
         if not self.workspace_root:
             raise PermissionError("Workspace root is not configured. File operations are blocked.")
@@ -63,12 +78,12 @@ class FileOpsTool(BaseTool):
         root = Path(self.workspace_root).resolve()
         target = (root / rel_path.strip().lstrip("/\\")).resolve()
 
-        if root != target and root not in target.parents:
-            raise PermissionError(
-                f"Access denied: Path '{rel_path}' escapes workspace boundary '{root}'."
-            )
+        # Update policy workspace root if modified
+        if self.security_policy.workspace_root != root:
+            self.security_policy.workspace_root = root
 
-        return target
+        # Enforce security verification
+        return self.security_policy.check_path_access(target)
 
     def _sync_read(self, path: Path, encoding: str) -> ToolResult:
         if not path.is_file():
@@ -202,12 +217,12 @@ class FileOpsTool(BaseTool):
         """Execute the requested file operation non-blockingly."""
         try:
             safe_target = self._resolve_safe_path(path)
-        except PermissionError as perm_err:
+        except (PermissionError, SecurityViolationError) as sec_err:
             return ToolResult(
-                output=str(perm_err),
+                output=str(sec_err),
                 exit_code=1,
                 is_error=True,
-                metadata={"error_type": "PermissionError"},
+                metadata={"error_type": type(sec_err).__name__},
             )
 
         if action == "read":
