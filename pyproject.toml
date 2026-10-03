@@ -24,6 +24,9 @@ dev = [
     "pytest-asyncio>=0.21.0"
 ]
 
+[project.scripts]
+peldrun = "peldrun.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["peldrun"]
 
