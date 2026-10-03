@@ -1,0 +1,4 @@
+# PELDRUN Core Runtime Dependencies
+pydantic>=2.0.0
+httpx>=0.25.0
+aiofiles>=23.0.0
