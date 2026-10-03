@@ -1,6 +1,7 @@
 """
 PELDRUN Core Docker Container Sandbox Implementation.
 Executes commands and manages workspace files within an isolated Docker container runtime.
+Supports live Docker CLI execution and injectable command runners for hermetic testing.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from pydantic import Field
 
 from peldrun.sandbox.base import BaseSandbox, SandboxConfig, SandboxResult
@@ -22,27 +23,27 @@ class DockerSandboxConfig(SandboxConfig):
     """Extended configuration schema for Docker-based sandbox environments."""
     image: str = Field(
         default="python:3.11-slim",
-        description="Docker image tag used for container instantiation"
+        description="Docker image tag used for container instantiation",
     )
     container_prefix: str = Field(
         default="peldrun-sandbox",
-        description="Prefix for uniquely generated container names"
+        description="Prefix for uniquely generated container names",
     )
     network_disabled: bool = Field(
         default=False,
-        description="Whether to isolate container from network access (--network none)"
+        description="Whether to isolate container from network access (--network none)",
     )
     memory_limit: str = Field(
         default="2g",
-        description="Memory ceiling enforced on container (--memory)"
+        description="Memory ceiling enforced on container (--memory)",
     )
     cpu_quota: float = Field(
         default=1.0,
-        description="Maximum CPU cores allocated to container (--cpus)"
+        description="Maximum CPU cores allocated to container (--cpus)",
     )
     auto_remove: bool = Field(
         default=True,
-        description="Automatically prune container upon cleanup"
+        description="Automatically prune container upon cleanup",
     )
 
 
@@ -52,9 +53,14 @@ class DockerSandbox(BaseSandbox):
     Mounts host workspace into /workspace and executes commands non-blockingly via docker exec.
     """
 
-    def __init__(self, config: Optional[DockerSandboxConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[DockerSandboxConfig] = None,
+        cmd_runner: Optional[Callable[[List[str], Optional[float]], Awaitable[Tuple[int, str, str]]]] = None,
+    ) -> None:
         super().__init__(config=config or DockerSandboxConfig())
         self.docker_config: DockerSandboxConfig = self.config  # type: ignore[assignment]
+        self._cmd_runner = cmd_runner
         self._container_id: Optional[str] = None
         self._container_name: str = f"{self.docker_config.container_prefix}-{uuid.uuid4().hex[:8]}"
         self._initialized: bool = False
@@ -65,13 +71,22 @@ class DockerSandbox(BaseSandbox):
         """Return active container name."""
         return self._container_name
 
-    async def _run_command(self, cmd_args: list[str], timeout: Optional[float] = 30.0) -> tuple[int, str, str]:
-        """Helper to run a subprocess command safely."""
-        proc = await asyncio.create_subprocess_exec(
-            *cmd_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    async def _run_command(self, cmd_args: List[str], timeout: Optional[float] = 30.0) -> Tuple[int, str, str]:
+        """Helper to run a subprocess command safely or delegate to custom cmd_runner."""
+        if self._cmd_runner is not None:
+            return await self._cmd_runner(cmd_args, timeout)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as fnf_err:
+            return 127, "", f"Docker executable not found: {fnf_err}"
+        except Exception as ex:
+            return 1, "", str(ex)
+
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             exit_code = proc.returncode if proc.returncode is not None else 0

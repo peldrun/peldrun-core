@@ -32,6 +32,7 @@ def get_sandbox(
         return LocalProcessSandbox(config=cfg)
 
     elif key in ("docker", "container"):
+        cmd_runner = kwargs.pop("cmd_runner", None)
         cfg = (
             config
             if isinstance(config, DockerSandboxConfig)
@@ -39,7 +40,7 @@ def get_sandbox(
         )
         if workspace_root:
             cfg.workspace_root = workspace_root
-        return DockerSandbox(config=cfg)
+        return DockerSandbox(config=cfg, cmd_runner=cmd_runner)
 
     else:
         raise ValueError(f"Unsupported sandbox type: '{sandbox_type}'. Expected 'local' or 'docker'.")
