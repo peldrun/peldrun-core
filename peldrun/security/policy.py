@@ -30,13 +30,13 @@ class ActionRiskLevel(str, Enum):
 
 # Critical destructive patterns that are strictly prohibited by default
 BLOCKED_COMMAND_PATTERNS: List[re.Pattern] = [
-    re.compile(r"\brm\s+-[rRfF]*\s+/\b"),                 # rm -rf /
-    re.compile(r"\brmdir\s+/[sS]\s+/[qQ]\s+[a-zA-Z]:\\"), # Windows rmdir /s /q C:\
-    re.compile(r"\bmkfs\b"),                              # Format filesystem
-    re.compile(r"\bformat\s+[a-zA-Z]:", re.IGNORECASE),   # format C:
-    re.compile(r":\(\)\{\s*:\s*\|\s*:\s*&\s*\};\s*:", re.IGNORECASE), # Fork bomb
-    re.compile(r"\bdd\s+if=.*\s+of=/dev/"),               # Overwriting raw block devices
-    re.compile(r"\b(shutdown|reboot|poweroff|init\s+0)\b", re.IGNORECASE), # System disruption
+    re.compile(r"\brm\s+-[rRfF\s]*\s+(/|/\*|\*)(\s+|$)", re.IGNORECASE),  # rm -rf / or rm -rf /*
+    re.compile(r"\brmdir\s+/[sS]\s+/[qQ]\s+[a-zA-Z]:\\?", re.IGNORECASE), # Windows rmdir /s /q C:\
+    re.compile(r"\bmkfs\b", re.IGNORECASE),                               # Format filesystem
+    re.compile(r"\bformat\s+[a-zA-Z]:", re.IGNORECASE),                   # format C:
+    re.compile(r":\(\)\{\s*:\s*\|\s*:\s*&\s*\};\s*:", re.IGNORECASE),    # Fork bomb
+    re.compile(r"\bdd\s+if=.*\s+of=/dev/", re.IGNORECASE),               # Overwriting raw block devices
+    re.compile(r"\b(shutdown|reboot|poweroff|init\s+0)\b", re.IGNORECASE),# System disruption
 ]
 
 # Sensitive files that should never be read or written without explicit authorization
@@ -103,7 +103,7 @@ class SecurityPolicy(BaseModel):
         description="Prompt human confirmation before executing high-risk commands or writes."
     )
     max_file_size_bytes: int = Field(
-        default=10 * 1024 * 1024, # 10 MB
+        default=10 * 1024 * 1024,  # 10 MB
         description="Maximum allowed file size for reading/writing."
     )
     execution_timeout_seconds: float = Field(
@@ -132,7 +132,7 @@ class SecurityPolicy(BaseModel):
         name_lower = tool_name.lower()
 
         if any(term in name_lower for term in ["bash", "shell", "exec", "terminal", "cmd"]):
-            cmd = arguments.get("command", "")
+            cmd = str(arguments.get("command", ""))
             # Check for high-risk write or deletion commands
             if any(term in cmd for term in ["rm ", "del ", "erase ", "drop ", "truncate"]):
                 return ActionRiskLevel.CRITICAL_DESTRUCTIVE
