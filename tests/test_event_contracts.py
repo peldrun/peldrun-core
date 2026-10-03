@@ -1,12 +1,13 @@
 """
 PELDRUN Core Event Protocol & Contract Verification Test Suite.
 Validates the strict Envelope pattern, typed payloads, wire format purity,
-and concurrent sequence monotonicity.
+concurrent thread-safety, and monotonic sequence allocation.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 from uuid import UUID, uuid4
 import pytest
@@ -19,7 +20,6 @@ from peldrun.events.schema import (
     SnapshotEvent,
     ToolCallEvent,
     AskHumanEvent,
-    ToolCallPayload,
 )
 
 
@@ -172,6 +172,104 @@ def test_subclass_strictness_literal_enforcement() -> None:
         SnapshotEvent(type=EventType.ERROR)
 
 
+def test_legacy_id_data_input_normalization() -> None:
+    # Legacy fields (id and data) accepted on input instantiation
+    legacy_id = str(uuid4())
+    event = PeldrunEvent(
+        type=EventType.THOUGHT,
+        id=legacy_id,
+        data={"thought": "legacy payload"},
+    )
+    assert str(event.event_id) == legacy_id
+    assert event.payload["thought"] == "legacy payload"
+    wire = event.to_sse_payload()
+    assert "id" not in wire
+    assert "data" not in wire
+
+
+def test_external_sequence_cannot_break_monotonicity() -> None:
+    emitter = EventEmitter()
+
+    # Explicit sequence without replay=True must raise ValueError
+    with pytest.raises(ValueError):
+        emitter.create_event(EventType.THOUGHT, payload={"thought": "x"}, sequence=100)
+
+    # Valid replay sequence updates sequence counter
+    ev100 = emitter.create_event(EventType.THOUGHT, payload={"thought": "replay"}, sequence=100, replay=True)
+    assert ev100.sequence == 100
+    assert emitter.current_sequence == 100
+
+    # Lower replay sequence must be rejected as it violates monotonicity
+    with pytest.raises(ValueError):
+        emitter.create_event(EventType.THOUGHT, payload={"thought": "broken"}, sequence=2, replay=True)
+
+
+@pytest.mark.asyncio
+async def test_allow_external_sequence_actually_changes_behavior() -> None:
+    emitter = EventEmitter()
+    emitter.reset_sequence(start=50)
+
+    # Historical event with lower sequence
+    ev_ext = PeldrunEvent(
+        type=EventType.THOUGHT,
+        sequence=10,
+        payload={"thought": "historical replay"},
+    )
+
+    # In external replay mode, sequence 10 is preserved as-is
+    await emitter.emit(ev_ext, allow_external_sequence=True)
+    assert ev_ext.sequence == 10
+    assert emitter.current_sequence == 50
+
+    # In canonical live mode, a lower sequence event is monotonically corrected
+    ev_lower = PeldrunEvent(
+        type=EventType.THOUGHT,
+        sequence=10,
+        payload={"thought": "out-of-order live event"},
+    )
+    await emitter.emit(ev_lower, allow_external_sequence=False)
+    assert ev_lower.sequence == 51
+    assert emitter.current_sequence == 51
+
+
+@pytest.mark.asyncio
+async def test_lower_sequence_event_is_rejected_or_corrected() -> None:
+    emitter = EventEmitter()
+    ev1 = emitter.create_event(EventType.THOUGHT, payload={"thought": "step 1"})
+    assert ev1.sequence == 1
+    await emitter.emit(ev1)
+
+    # Unsequenced event (sequence=0) must be automatically allocated sequence 2
+    ev2 = PeldrunEvent(type=EventType.THOUGHT, sequence=0, payload={"thought": "step 2"})
+    await emitter.emit(ev2)
+    assert ev2.sequence == 2
+
+    # Lower sequence event (sequence=1) emitted after sequence 2 must be corrected to 3
+    ev_lower = PeldrunEvent(type=EventType.THOUGHT, sequence=1, payload={"thought": "delayed"})
+    await emitter.emit(ev_lower)
+    assert ev_lower.sequence == 3
+
+
+def test_thread_safety_sequence_allocation() -> None:
+    emitter = EventEmitter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        futures = [
+            ex.submit(
+                emitter.create_event,
+                EventType.AGENT_ACTIVITY,
+                {"message": f"task {i}"},
+            )
+            for i in range(200)
+        ]
+        events = [f.result() for f in futures]
+
+    sequences = [e.sequence for e in events]
+    assert len(sequences) == 200
+    assert len(set(sequences)) == 200
+    assert min(sequences) == 1
+    assert max(sequences) == 200
+
+
 @pytest.mark.asyncio
 async def test_concurrent_monotonic_sequence_allocation() -> None:
     emitter = EventEmitter()
@@ -199,3 +297,24 @@ async def test_concurrent_monotonic_sequence_allocation() -> None:
     assert len(sequences) == len(set(sequences))
     assert min(sequences) == 1
     assert max(sequences) == 100
+
+
+@pytest.mark.asyncio
+async def test_astream_sse_termination_at_final() -> None:
+    emitter = EventEmitter()
+    stream_results: list[str] = []
+
+    async def consume() -> None:
+        async for frame in emitter.astream_sse():
+            stream_results.append(frame)
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.01)
+
+    await emitter.emit_thought("Analyzing...")
+    await emitter.emit_final("Done.")
+
+    await asyncio.wait_for(task, timeout=2.0)
+    assert len(stream_results) == 2
+    assert "event: thought" in stream_results[0]
+    assert "event: final" in stream_results[1]

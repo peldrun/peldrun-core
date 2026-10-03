@@ -7,6 +7,7 @@ with thread-safe and coroutine-safe monotonic sequence numbering and multi-run i
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections import defaultdict
 from typing import Any, AsyncIterator, Callable, Coroutine, Dict, List, Optional, Set, Union
@@ -18,11 +19,13 @@ EventListener = Callable[[PeldrunEvent], Coroutine[Any, Any, None]]
 
 
 class EventEmitter:
-    """Thread-safe and asynchronous event broadcaster supporting sequence tracking and SSE queues."""
+    """Thread-safe and coroutine-safe event broadcaster supporting sequence tracking and SSE queues."""
 
     def __init__(self, run_id: Optional[Union[UUID, str]] = None) -> None:
         self._run_id: UUID = self._coerce_uuid(run_id) if run_id else uuid4()
         self._sequence_counter: int = 0
+        self._last_emitted_sequence: int = 0
+        self._seq_lock = threading.Lock()
         self._lock = asyncio.Lock()
         self._listeners: Dict[str, List[EventListener]] = defaultdict(list)
         self._global_listeners: List[EventListener] = []
@@ -49,11 +52,14 @@ class EventEmitter:
     @property
     def current_sequence(self) -> int:
         """Current monotonic sequence index."""
-        return self._sequence_counter
+        with self._seq_lock:
+            return self._sequence_counter
 
     def reset_sequence(self, start: int = 0) -> None:
         """Reset the sequence counter to a designated baseline."""
-        self._sequence_counter = start
+        with self._seq_lock:
+            self._sequence_counter = start
+            self._last_emitted_sequence = start
 
     def create_event(
         self,
@@ -63,15 +69,27 @@ class EventEmitter:
         step: int = 0,
         run_id: Optional[Union[UUID, str]] = None,
         sequence: Optional[int] = None,
+        replay: bool = False,
     ) -> PeldrunEvent:
-        """Factory method producing a strictly valid PeldrunEvent with assigned sequence."""
-        if sequence is not None:
-            assigned_sequence = sequence
-            if sequence > self._sequence_counter:
+        """
+        Factory method producing a strictly valid PeldrunEvent.
+        Explicit sequence override is forbidden unless replay=True and sequence is strictly monotonic.
+        """
+        with self._seq_lock:
+            if sequence is not None:
+                if not replay:
+                    raise ValueError(
+                        "Explicit sequence assignment is forbidden outside replay mode. Pass replay=True to import historical events."
+                    )
+                if sequence <= self._sequence_counter:
+                    raise ValueError(
+                        f"Replay sequence {sequence} violates monotonicity; current sequence counter is {self._sequence_counter}."
+                    )
                 self._sequence_counter = sequence
-        else:
-            self._sequence_counter += 1
-            assigned_sequence = self._sequence_counter
+                assigned_sequence = sequence
+            else:
+                self._sequence_counter += 1
+                assigned_sequence = self._sequence_counter
 
         resolved_type = EventType(event_type) if not isinstance(event_type, EventType) else event_type
         target_run_id = self._coerce_uuid(run_id) if run_id else self._run_id
@@ -113,15 +131,21 @@ class EventEmitter:
         Guarantees thread-safe and coroutine-safe strictly monotonic sequence allocation.
         """
         async with self._lock:
-            if event.sequence <= 0:
-                self._sequence_counter += 1
-                event.sequence = self._sequence_counter
-            elif allow_external_sequence:
-                if event.sequence > self._sequence_counter:
-                    self._sequence_counter = event.sequence
-            else:
-                if event.sequence > self._sequence_counter:
-                    self._sequence_counter = event.sequence
+            with self._seq_lock:
+                if event.sequence <= 0:
+                    self._sequence_counter += 1
+                    event.sequence = self._sequence_counter
+                elif not allow_external_sequence:
+                    if event.sequence <= self._last_emitted_sequence:
+                        self._sequence_counter = max(self._sequence_counter, self._last_emitted_sequence) + 1
+                        event.sequence = self._sequence_counter
+                    elif event.sequence > self._sequence_counter:
+                        self._sequence_counter = event.sequence
+                else:
+                    if event.sequence > self._sequence_counter:
+                        self._sequence_counter = event.sequence
+
+                self._last_emitted_sequence = max(self._last_emitted_sequence, event.sequence)
 
             key = event.type.value if hasattr(event.type, "value") else str(event.type)
             targets = list(self._listeners.get(key, [])) + list(self._global_listeners)
