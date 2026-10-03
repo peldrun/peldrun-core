@@ -1,0 +1,32 @@
+﻿[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "peldrun-core"
+version = "0.1.0"
+description = "High-performance autonomous agent orchestration core"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "PELDRUN Authors and Contributors" }
+]
+dependencies = [
+    "pydantic>=2.0.0",
+    "httpx>=0.25.0",
+    "aiofiles>=23.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["peldrun"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
