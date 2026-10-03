@@ -9,6 +9,7 @@ from peldrun.llm.client import (
     LLMConfig,
     LLMResponse,
     StreamChunk,
+    accumulate_stream_chunks,
 )
 from peldrun.llm.providers import (
     BaseLLMProvider,
@@ -31,6 +32,7 @@ __all__ = [
     "LLMResponse",
     "StreamChunk",
     "DeltaToolCall",
+    "accumulate_stream_chunks",
     # Tokenizer & context budgeting
     "ContextBudgetManager",
     "count_message_tokens",

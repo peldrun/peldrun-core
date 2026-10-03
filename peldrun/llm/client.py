@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,39 +23,39 @@ class LLMConfig(BaseModel):
 
     api_base: str = Field(
         default="http://localhost:1234/v1",
-        description="Base URL for OpenAI-compatible endpoint"
+        description="Base URL for OpenAI-compatible endpoint",
     )
     model: str = Field(
         default="local-model",
-        description="Target model identifier"
+        description="Target model identifier",
     )
     api_key: Optional[str] = Field(
         default=None,
-        description="Optional API authorization key"
+        description="Optional API authorization key",
     )
     temperature: float = Field(
         default=0.7,
         ge=0.0,
         le=2.0,
-        description="Sampling temperature"
+        description="Sampling temperature",
     )
     max_tokens: Optional[int] = Field(
         default=None,
-        description="Maximum generation token ceiling"
+        description="Maximum generation token ceiling",
     )
     top_p: Optional[float] = Field(
         default=None,
         ge=0.0,
         le=1.0,
-        description="Nucleus sampling parameter"
+        description="Nucleus sampling parameter",
     )
     timeout: float = Field(
         default=120.0,
-        description="HTTP request timeout ceiling in seconds"
+        description="HTTP request timeout ceiling in seconds",
     )
     max_retries: int = Field(
         default=3,
-        description="Maximum retry attempts on connection drops or transient errors"
+        description="Maximum retry attempts on connection drops or transient errors",
     )
 
 
@@ -90,8 +90,13 @@ class AsyncLLMClient:
     Supports connection pooling, streaming generation, and structured function calling.
     """
 
-    def __init__(self, config: Optional[LLMConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[LLMConfig] = None,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ) -> None:
         self.config = config or LLMConfig()
+        self._transport = transport
         self._client: Optional[httpx.AsyncClient] = None
         self._lock = asyncio.Lock()
 
@@ -110,6 +115,7 @@ class AsyncLLMClient:
                     headers=headers,
                     timeout=httpx.Timeout(self.config.timeout, connect=10.0),
                     limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+                    transport=self._transport,
                 )
             return self._client
 
@@ -206,7 +212,7 @@ class AsyncLLMClient:
                     str(ex),
                 )
                 if attempt < self.config.max_retries:
-                    await asyncio.sleep(1.0 * (2 ** (attempt - 1)))
+                    await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
                 else:
                     break
 
@@ -293,3 +299,63 @@ class AsyncLLMClient:
         except Exception as ex:
             logger.debug("LLM endpoint connectivity check failed: %s", ex)
             return False
+
+
+async def accumulate_stream_chunks(
+    stream: AsyncIterator[StreamChunk],
+    model: str = "",
+) -> Tuple[LLMResponse, List[StreamChunk]]:
+    """
+    Consumes a stream of StreamChunk items and reconstructs the consolidated LLMResponse.
+    Returns a tuple of (LLMResponse, List[StreamChunk]).
+    """
+    chunks: List[StreamChunk] = []
+    content_parts: List[str] = []
+    tool_calls_map: Dict[int, Dict[str, Any]] = {}
+    finish_reason: Optional[str] = "stop"
+    usage: Optional[Dict[str, int]] = None
+
+    async for chunk in stream:
+        chunks.append(chunk)
+
+        if chunk.content:
+            content_parts.append(chunk.content)
+
+        if chunk.tool_calls:
+            for delta in chunk.tool_calls:
+                idx = delta.index
+                if idx not in tool_calls_map:
+                    tool_calls_map[idx] = {
+                        "id": delta.id or f"call_{idx}",
+                        "type": "function",
+                        "function": {
+                            "name": delta.name or "",
+                            "arguments": "",
+                        },
+                    }
+                else:
+                    if delta.id:
+                        tool_calls_map[idx]["id"] = delta.id
+                    if delta.name:
+                        tool_calls_map[idx]["function"]["name"] = delta.name
+
+                if delta.arguments:
+                    tool_calls_map[idx]["function"]["arguments"] += delta.arguments
+
+        if chunk.finish_reason:
+            finish_reason = chunk.finish_reason
+
+        if chunk.usage:
+            usage = chunk.usage
+
+    sorted_indices = sorted(tool_calls_map.keys())
+    consolidated_tool_calls = [tool_calls_map[i] for i in sorted_indices] if tool_calls_map else None
+    final_content = "".join(content_parts) if content_parts else None
+
+    response = LLMResponse(
+        content=final_content,
+        tool_calls=consolidated_tool_calls,
+        finish_reason=finish_reason,
+        usage=usage,
+    )
+    return response, chunks

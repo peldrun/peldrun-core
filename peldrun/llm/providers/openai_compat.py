@@ -9,6 +9,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
+import httpx
+
 from peldrun.llm.client import AsyncLLMClient, LLMConfig, LLMResponse, StreamChunk
 from peldrun.llm.tokenizer import ContextBudgetManager
 
@@ -74,6 +76,7 @@ class OpenAICompatProvider(BaseLLMProvider):
         config: Optional[LLMConfig] = None,
         budget_manager: Optional[ContextBudgetManager] = None,
         client: Optional[AsyncLLMClient] = None,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
         self.config = config or LLMConfig()
         self.budget_manager = budget_manager or ContextBudgetManager(
@@ -81,7 +84,7 @@ class OpenAICompatProvider(BaseLLMProvider):
             max_generation_tokens=self.config.max_tokens or 2048,
             model_name=self.config.model,
         )
-        self.client = client or AsyncLLMClient(config=self.config)
+        self.client = client or AsyncLLMClient(config=self.config, transport=transport)
 
     @property
     def name(self) -> str:
