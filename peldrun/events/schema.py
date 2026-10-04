@@ -86,7 +86,7 @@ class ObservationPayload(BaseModel):
     output: Any = ""
     exit_code: int = 0
     is_error: bool = False
-    artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    artifacts: List[Union[Dict[str, Any], str]] = Field(default_factory=list)
     tool_call_id: str = ""
 
 
@@ -169,7 +169,9 @@ class PeldrunEvent(BaseModel):
     @field_validator("event_id", "run_id", mode="before")
     @classmethod
     def _validate_uuid(cls, value: Any) -> UUID:
-        """Enforce strict UUID validation without silent fallback."""
+        """Enforce strict UUID validation without silent fallback while allowing None to generate default."""
+        if value is None:
+            return uuid4()
         if isinstance(value, UUID):
             return value
         if isinstance(value, str):

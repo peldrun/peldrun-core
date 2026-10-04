@@ -22,7 +22,7 @@ class EventEmitter:
     """Thread-safe and coroutine-safe event broadcaster supporting sequence tracking and SSE queues."""
 
     def __init__(self, run_id: Optional[Union[UUID, str]] = None) -> None:
-        self._run_id: UUID = self._coerce_uuid(run_id) if run_id else uuid4()
+        self._run_id: UUID = self._coerce_uuid(run_id) if run_id is not None else uuid4()
         self._sequence_counter: int = 0
         self._last_emitted_sequence: int = 0
         self._seq_lock = threading.Lock()
@@ -32,8 +32,10 @@ class EventEmitter:
         self._sse_queues: Set[asyncio.Queue[PeldrunEvent]] = set()
 
     @staticmethod
-    def _coerce_uuid(value: Union[UUID, str]) -> UUID:
-        """Convert string or UUID instance to strict UUID, raising ValueError on invalid format."""
+    def _coerce_uuid(value: Optional[Union[UUID, str]]) -> UUID:
+        """Convert string or UUID instance to strict UUID, generating a new UUID if None."""
+        if value is None:
+            return uuid4()
         if isinstance(value, UUID):
             return value
         if isinstance(value, str):
@@ -46,7 +48,7 @@ class EventEmitter:
         return self._run_id
 
     @run_id.setter
-    def run_id(self, val: Union[UUID, str]) -> None:
+    def run_id(self, val: Optional[Union[UUID, str]]) -> None:
         self._run_id = self._coerce_uuid(val)
 
     @property
@@ -92,7 +94,7 @@ class EventEmitter:
                 assigned_sequence = self._sequence_counter
 
         resolved_type = EventType(event_type) if not isinstance(event_type, EventType) else event_type
-        target_run_id = self._coerce_uuid(run_id) if run_id else self._run_id
+        target_run_id = self._coerce_uuid(run_id) if run_id is not None else self._run_id
 
         return PeldrunEvent(
             version=1,
