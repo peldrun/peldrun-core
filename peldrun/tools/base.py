@@ -24,6 +24,18 @@ class ToolResult(BaseModel):
     artifacts: List[str] = Field(default_factory=list, description="Relative file paths produced as artifacts")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary execution telemetry")
 
+    @property
+    def is_success(self) -> bool:
+        """True if execution completed normally without error and exit code 0."""
+        return not self.is_error and self.exit_code == 0
+
+    @property
+    def error(self) -> str:
+        """Retrieve error details if execution failed, or empty string."""
+        if self.is_error:
+            return str(self.output or self.metadata.get("error", "Tool execution failed"))
+        return ""
+
     def to_observation_dict(self) -> Dict[str, Any]:
         """Convert result into standard observation payload format."""
         return {
@@ -145,3 +157,9 @@ class BaseTool(ABC):
                 is_error=True,
                 metadata={"error_type": type(ex).__name__},
             )
+
+
+__all__ = [
+    "ToolResult",
+    "BaseTool",
+]

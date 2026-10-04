@@ -73,8 +73,13 @@ class BaseSandbox(ABC):
     Guarantees consistent command execution, scoped filesystem access, and lifecycle controls.
     """
 
-    def __init__(self, config: Optional[SandboxConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[SandboxConfig] = None,
+        security_policy: Optional[Any] = None,
+    ) -> None:
         self.config = config or SandboxConfig()
+        self.security_policy = security_policy
 
     @property
     def workspace_root(self) -> Optional[str]:
@@ -87,7 +92,7 @@ class BaseSandbox(ABC):
 
     def resolve_safe_path(self, relative_path: str) -> Path:
         """
-        Validate and resolve a path against the workspace boundary.
+        Validate and resolve a path against the workspace boundary and security policy.
         Raises PermissionError if path attempts to traverse outside workspace root.
         """
         if not self.workspace_root:
@@ -100,6 +105,9 @@ class BaseSandbox(ABC):
             raise PermissionError(
                 f"Access denied: Path '{relative_path}' escapes sandbox boundary '{root}'."
             )
+
+        if self.security_policy is not None and hasattr(self.security_policy, "check_path_access"):
+            self.security_policy.check_path_access(target)
 
         return target
 
@@ -116,9 +124,7 @@ class BaseSandbox(ABC):
         workdir: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
     ) -> SandboxResult:
-        """
-        Execute command inside the sandbox boundary asynchronously.
-        """
+        """Execute command inside the sandbox boundary asynchronously."""
         ...
 
     @abstractmethod

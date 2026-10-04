@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from peldrun.sandbox.base import BaseSandbox, SandboxConfig, SandboxResult
+from peldrun.security.policy import SecurityViolationError
 
 logger = logging.getLogger("peldrun.sandbox.local_process")
 
@@ -24,8 +25,12 @@ class LocalProcessSandbox(BaseSandbox):
     strictly to the designated project workspace root on the local host.
     """
 
-    def __init__(self, config: Optional[SandboxConfig] = None) -> None:
-        super().__init__(config=config)
+    def __init__(
+        self,
+        config: Optional[SandboxConfig] = None,
+        security_policy: Optional[Any] = None,
+    ) -> None:
+        super().__init__(config=config, security_policy=security_policy)
         self._active_processes: set[asyncio.subprocess.Process] = set()
 
     async def ainitialize(self) -> None:
@@ -45,10 +50,26 @@ class LocalProcessSandbox(BaseSandbox):
         env: Optional[Dict[str, str]] = None,
     ) -> SandboxResult:
         """
-        Execute command asynchronously bounded inside the workspace directory.
+        Execute command asynchronously bounded inside the workspace directory,
+        validating against SecurityPolicy before launch.
         """
         if not self.workspace_root:
             raise PermissionError("Sandbox workspace root is not configured.")
+
+        # Pre-execution security check
+        if self.security_policy is not None and hasattr(self.security_policy, "check_command"):
+            try:
+                self.security_policy.check_command(command)
+            except SecurityViolationError as sec_err:
+                logger.warning("Security policy blocked command execution: %s", sec_err)
+                return SandboxResult(
+                    stdout="",
+                    stderr=f"Security violation: {str(sec_err)}",
+                    exit_code=126,
+                    duration_seconds=0.0,
+                    is_timeout=False,
+                    metadata={"security_blocked": True, "command": command},
+                )
 
         # Determine target working directory
         if workdir:
@@ -110,7 +131,6 @@ class LocalProcessSandbox(BaseSandbox):
             stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
-            # Truncate output streams if they exceed safety thresholds
             max_chars = self.config.max_output_chars
             if len(stdout_text) > max_chars:
                 stdout_text = (
@@ -180,7 +200,6 @@ class LocalProcessSandbox(BaseSandbox):
             if not root.exists():
                 await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True)
 
-            # Test write access with a temporary marker file
             test_file = root / ".peldrun_health_check"
 
             def _test_write() -> bool:

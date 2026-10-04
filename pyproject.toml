@@ -1,69 +1,55 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "peldrun-core"
-version = "0.1.0"
-description = "High-performance autonomous agent orchestration core"
+version = "0.2.0"
+description = "Standalone, modular AI agent engine and runtime architecture."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [
-    { name = "PELDRUN Authors and Contributors" }
-]
-keywords = [
-    "ai-agents",
-    "autonomous-agents",
-    "orchestration",
-    "react-loop",
-    "sse-streaming",
-    "runtime"
+    { name = "PELDRUN Engineering Team" }
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Operating System :: OS Independent",
 ]
 dependencies = [
-    "pydantic>=2.0.0",
-    "httpx>=0.25.0",
-    "aiofiles>=23.0.0"
+    "pydantic>=2.6.0",
+    "httpx>=0.27.0",
+    "sse-starlette>=2.0.0",
+    "tiktoken>=0.6.0",
 ]
 
 [project.optional-dependencies]
-docker = [
-    "docker>=7.0.0"
-]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "anyio>=4.0.0",
-    "build>=1.0.0",
-    "twine>=5.0.0"
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "flake8>=7.0.0",
+    "mypy>=1.8.0",
 ]
-all = [
-    "peldrun-core[docker,dev]"
+mcp = [
+    "mcp>=1.0.0",
+]
+docker = [
+    "docker>=7.0.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/peldrun/peldrun-core"
-Documentation = "https://github.com/peldrun/peldrun-core#readme"
-Repository = "https://github.com/peldrun/peldrun-core.git"
-Issues = "https://github.com/peldrun/peldrun-core/issues"
-
-[project.scripts]
-peldrun = "peldrun.cli:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["peldrun"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["peldrun*"]
 
 [tool.pytest.ini_options]
+minversion = "7.0"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+python_files = ["test_*.py"]

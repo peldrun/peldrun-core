@@ -1,7 +1,8 @@
 """
 PELDRUN Core Asynchronous Event Emitter.
 Dispatches strictly typed lifecycle events to registered subscribers and SSE streams
-with thread-safe and coroutine-safe monotonic sequence numbering and multi-run isolation.
+with thread-safe and coroutine-safe monotonic sequence numbering, multi-run isolation,
+and bounded historical replay buffer.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, AsyncIterator, Callable, Coroutine, Dict, List, Optional, Set, Union
 from uuid import UUID, uuid4
 
@@ -19,9 +20,9 @@ EventListener = Callable[[PeldrunEvent], Coroutine[Any, Any, None]]
 
 
 class EventEmitter:
-    """Thread-safe and coroutine-safe event broadcaster supporting sequence tracking and SSE queues."""
+    """Thread-safe and coroutine-safe event broadcaster supporting sequence tracking, replay buffer, and SSE queues."""
 
-    def __init__(self, run_id: Optional[Union[UUID, str]] = None) -> None:
+    def __init__(self, run_id: Optional[Union[UUID, str]] = None, buffer_capacity: int = 1000) -> None:
         self._run_id: UUID = self._coerce_uuid(run_id) if run_id is not None else uuid4()
         self._sequence_counter: int = 0
         self._last_emitted_sequence: int = 0
@@ -30,6 +31,8 @@ class EventEmitter:
         self._listeners: Dict[str, List[EventListener]] = defaultdict(list)
         self._global_listeners: List[EventListener] = []
         self._sse_queues: Set[asyncio.Queue[PeldrunEvent]] = set()
+        self._replay_buffer: deque[PeldrunEvent] = deque(maxlen=buffer_capacity)
+        self._is_terminated: bool = False
 
     @staticmethod
     def _coerce_uuid(value: Optional[Union[UUID, str]]) -> UUID:
@@ -56,6 +59,11 @@ class EventEmitter:
         """Current monotonic sequence index."""
         with self._seq_lock:
             return self._sequence_counter
+
+    @property
+    def is_terminated(self) -> bool:
+        """Indicates if a terminal lifecycle event has been emitted."""
+        return self._is_terminated
 
     def reset_sequence(self, start: int = 0) -> None:
         """Reset the sequence counter to a designated baseline."""
@@ -129,7 +137,7 @@ class EventEmitter:
 
     async def emit(self, event: PeldrunEvent, allow_external_sequence: bool = False) -> None:
         """
-        Publish an event across matching listeners and active SSE queues.
+        Publish an event across matching listeners, historical replay buffer, and active SSE queues.
         Guarantees thread-safe and coroutine-safe strictly monotonic sequence allocation.
         """
         async with self._lock:
@@ -153,6 +161,13 @@ class EventEmitter:
             targets = list(self._listeners.get(key, [])) + list(self._global_listeners)
             queues = list(self._sse_queues)
 
+            # Store in historical replay buffer
+            self._replay_buffer.append(event)
+
+            # Detect terminal lifecycle events
+            if key in (EventType.FINAL.value, EventType.ERROR.value):
+                self._is_terminated = True
+
         for listener in targets:
             try:
                 res = listener(event)
@@ -164,6 +179,17 @@ class EventEmitter:
 
         for q in queues:
             await q.put(event)
+
+    async def replay_after(self, after_sequence: int = 0) -> List[PeldrunEvent]:
+        """Fetch previously published events occurring strictly after sequence number."""
+        async with self._lock:
+            return [ev for ev in self._replay_buffer if ev.sequence > after_sequence]
+
+    async def ensure_terminated(self, default_error: Optional[str] = None) -> None:
+        """Enforce terminal event guarantee if execution halts unexpectedly without final status."""
+        if not self._is_terminated:
+            err_msg = default_error or "Execution terminated unexpectedly without final status."
+            await self.emit_error(error=err_msg)
 
     async def astream_sse(self) -> AsyncIterator[str]:
         """Asynchronously yield formatted SSE string frames as events occur."""

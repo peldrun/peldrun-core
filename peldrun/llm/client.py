@@ -282,11 +282,15 @@ class AsyncLLMClient:
                     continue
 
 
+# Backward-compatibility alias
+LLMClient = AsyncLLMClient
+
 __all__ = [
     "LLMConfig",
     "StreamChunk",
     "DeltaToolCall",
     "LLMResponse",
     "AsyncLLMClient",
+    "LLMClient",
     "accumulate_stream_chunks",
 ]
