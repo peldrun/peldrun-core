@@ -1,140 +1,177 @@
 """
-PELDRUN Core OpenAI-Compatible Provider Adapter.
-Defines the base LLM provider interface and the standard OpenAI protocol implementation.
+PELDRUN Core OpenAI-Compatible LLM Provider.
+Defines the BaseLLMProvider abstract interface and the OpenAICompatProvider
+concrete implementation for standard OpenAI-compatible endpoints.
 """
 
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
-
+from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
 
-from peldrun.llm.client import AsyncLLMClient, LLMConfig, LLMResponse, StreamChunk
-from peldrun.llm.tokenizer import ContextBudgetManager
-
-logger = logging.getLogger("peldrun.llm.providers.openai_compat")
+from peldrun.llm.client import (
+    AsyncLLMClient,
+    LLMConfig,
+    LLMResponse,
+    StreamChunk,
+)
 
 
 class BaseLLMProvider(ABC):
-    """
-    Abstract base class for LLM inference providers.
-    Enforces unified interfaces for non-streaming completions, streaming responses,
-    and connectivity health checks.
-    """
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Provider identifier string."""
-        ...
-
-    @abstractmethod
-    async def generate(
-        self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> LLMResponse:
-        """Execute a non-streaming completion request."""
-        ...
-
-    @abstractmethod
-    async def stream(
-        self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> AsyncIterator[StreamChunk]:
-        """Stream completion tokens and tool invocation fragments asynchronously."""
-        ...
-
-    @abstractmethod
-    async def check_health(self) -> bool:
-        """Verify reachability and readiness of the provider endpoint."""
-        ...
-
-    @abstractmethod
-    async def close(self) -> None:
-        """Release underlying HTTP connections and provider resources."""
-        ...
-
-
-class OpenAICompatProvider(BaseLLMProvider):
-    """
-    Standard OpenAI-compatible provider adapter.
-    Operates against local servers (LM Studio, Ollama, vLLM) and compatible cloud endpoints.
-    """
+    """Abstract base class for all PELDRUN LLM providers."""
 
     def __init__(
         self,
         config: Optional[LLMConfig] = None,
-        budget_manager: Optional[ContextBudgetManager] = None,
         client: Optional[AsyncLLMClient] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        **kwargs: Any,
     ) -> None:
-        self.config = config or LLMConfig()
-        self.budget_manager = budget_manager or ContextBudgetManager(
-            max_context_window=8192,
-            max_generation_tokens=self.config.max_tokens or 2048,
-            model_name=self.config.model,
+        if config is not None:
+            self.config = config
+        elif client is not None and hasattr(client, "config") and client.config is not None:
+            self.config = client.config
+        else:
+            self.config = LLMConfig()
+
+        self.name: str = "base"
+        self._owned_http_client: Optional[httpx.AsyncClient] = None
+        self.client: AsyncLLMClient = client or AsyncLLMClient(
+            config=self.config,
+            transport=transport,
+            **kwargs,
         )
-        self.client = client or AsyncLLMClient(config=self.config, transport=transport)
 
-    @property
-    def name(self) -> str:
-        return "openai_compat"
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Resolve or lazily initialize the active httpx.AsyncClient."""
+        if isinstance(self.client, httpx.AsyncClient):
+            return self.client
 
-    def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fit messages inside the allowed context window before dispatching."""
-        return self.budget_manager.fit_messages(messages)
+        for method_name in ["_get_client", "get_client", "_ensure_client"]:
+            method = getattr(self.client, method_name, None)
+            if callable(method):
+                try:
+                    c = method()
+                    if isinstance(c, httpx.AsyncClient):
+                        return c
+                except Exception:
+                    pass
+
+        for attr in ["_client", "client", "_http_client", "http_client", "_session", "session", "_http"]:
+            val = getattr(self.client, attr, None)
+            if isinstance(val, httpx.AsyncClient):
+                return val
+
+        if self._owned_http_client is not None and not self._owned_http_client.is_closed:
+            return self._owned_http_client
+
+        transport = getattr(self.client, "transport", getattr(self.client, "_transport", None))
+        base_url = getattr(self.config, "api_base", "http://localhost:1234/v1")
+        self._owned_http_client = httpx.AsyncClient(
+            base_url=str(base_url),
+            transport=transport,
+            timeout=getattr(self.config, "timeout", 120.0),
+        )
+
+        if hasattr(self.client, "_client"):
+            self.client._client = self._owned_http_client
+
+        return self._owned_http_client
+
+    async def close(self) -> None:
+        """Gracefully close underlying client sessions."""
+        if self.client and hasattr(self.client, "close"):
+            await self.client.close()
+        if self._owned_http_client is not None and not self._owned_http_client.is_closed:
+            await self._owned_http_client.aclose()
+
+    @abstractmethod
+    async def generate(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Execute a non-streaming chat completion request."""
+        pass
+
+    @abstractmethod
+    async def stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream chat completion chunks asynchronously."""
+        pass
+
+
+class OpenAICompatProvider(BaseLLMProvider):
+    """OpenAI-compatible LLM provider with robust client binding."""
+
+    def __init__(
+        self,
+        config: Optional[LLMConfig] = None,
+        client: Optional[AsyncLLMClient] = None,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(config=config, client=client, transport=transport, **kwargs)
+        self.name = "openai_compat"
 
     async def generate(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        **kwargs: Any,
     ) -> LLMResponse:
-        """Execute a non-streaming chat completion with budgeted messages."""
-        fitted_messages = self._prepare_messages(messages)
+        """Execute a non-streaming chat completion request."""
+        if "model" in kwargs:
+            self.config.model = kwargs.pop("model")
+            if hasattr(self.client, "config") and self.client.config:
+                self.client.config.model = self.config.model
+        if "temperature" in kwargs:
+            self.config.temperature = kwargs.pop("temperature")
+            if hasattr(self.client, "config") and self.client.config:
+                self.client.config.temperature = self.config.temperature
+        if "max_tokens" in kwargs:
+            self.config.max_tokens = kwargs.pop("max_tokens")
+            if hasattr(self.client, "config") and self.client.config:
+                self.client.config.max_tokens = self.config.max_tokens
+
         return await self.client.chat_completion(
-            messages=fitted_messages,
+            messages=messages,
             tools=tools,
-            tool_choice=tool_choice,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            **kwargs,
         )
 
     async def stream(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        """Stream tokens asynchronously with budgeted messages."""
-        fitted_messages = self._prepare_messages(messages)
+        """Stream chat completion chunks asynchronously."""
+        if "model" in kwargs:
+            self.config.model = kwargs.pop("model")
+            if hasattr(self.client, "config") and self.client.config:
+                self.client.config.model = self.config.model
+        if "temperature" in kwargs:
+            self.config.temperature = kwargs.pop("temperature")
+            if hasattr(self.client, "config") and self.client.config:
+                self.client.config.temperature = self.config.temperature
+        if "max_tokens" in kwargs:
+            self.config.max_tokens = kwargs.pop("max_tokens")
+            if hasattr(self.client, "config") and self.client.config:
+                self.client.config.max_tokens = self.config.max_tokens
+
         async for chunk in self.client.stream_chat(
-            messages=fitted_messages,
+            messages=messages,
             tools=tools,
-            tool_choice=tool_choice,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            **kwargs,
         ):
             yield chunk
 
-    async def check_health(self) -> bool:
-        """Verify reachability of the endpoint."""
-        return await self.client.test_connection()
 
-    async def close(self) -> None:
-        """Close client connection pool."""
-        await self.client.close()
+__all__ = ["BaseLLMProvider", "OpenAICompatProvider"]

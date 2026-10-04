@@ -1,223 +1,222 @@
 """
-PELDRUN Core Unified LLM Client.
-Provides an asynchronous, non-blocking HTTP client for OpenAI-compatible APIs,
-supporting local providers (LM Studio, Ollama) and cloud inference endpoints.
+PELDRUN Core Asynchronous LLM Client.
+Unified OpenAI-compatible asynchronous HTTP client supporting streaming, function calling,
+and resilient error logging and auto-healing retries.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
 
-logger = logging.getLogger("peldrun.llm.client")
-
-
-class LLMConfig(BaseModel):
-    """Configuration parameters for the unified LLM client."""
-    model_config = ConfigDict(extra="ignore")
-
-    api_base: str = Field(
-        default="http://localhost:1234/v1",
-        description="Base URL for OpenAI-compatible endpoint",
-    )
-    model: str = Field(
-        default="local-model",
-        description="Target model identifier",
-    )
-    api_key: Optional[str] = Field(
-        default=None,
-        description="Optional API authorization key",
-    )
-    temperature: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=2.0,
-        description="Sampling temperature",
-    )
-    max_tokens: Optional[int] = Field(
-        default=None,
-        description="Maximum generation token ceiling",
-    )
-    top_p: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Nucleus sampling parameter",
-    )
-    timeout: float = Field(
-        default=120.0,
-        description="HTTP request timeout ceiling in seconds",
-    )
-    max_retries: int = Field(
-        default=3,
-        description="Maximum retry attempts on connection drops or transient errors",
-    )
+logger = logging.getLogger(__name__)
 
 
-class DeltaToolCall(BaseModel):
-    """Chunk of an incremental tool call received during streaming."""
-    index: int = Field(default=0)
-    id: Optional[str] = Field(default=None)
-    name: Optional[str] = Field(default=None)
-    arguments: Optional[str] = Field(default=None)
+@dataclass
+class LLMConfig:
+    """Configuration parameters for LLM client connectivity and model execution."""
+    api_base: str = "http://localhost:1234/v1"
+    model: str = "local-model"
+    api_key: str = "EMPTY"
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    timeout: float = 120.0
+    max_retries: int = 3
+    provider: str = "openai_compat"
+    base_url: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.base_url and not self.api_base:
+            self.api_base = self.base_url
+        elif self.api_base and not self.base_url:
+            self.base_url = self.api_base
 
 
-class StreamChunk(BaseModel):
-    """Single parsed token or delta fragment from a streaming completion."""
-    content: Optional[str] = Field(default=None)
-    tool_calls: Optional[List[DeltaToolCall]] = Field(default=None)
-    finish_reason: Optional[str] = Field(default=None)
-    usage: Optional[Dict[str, int]] = Field(default=None)
+@dataclass
+class DeltaToolCall:
+    """Incremental tool call fragment received during streaming."""
+    index: int = 0
+    id: Optional[str] = None
+    name: Optional[str] = None
+    arguments: str = ""
 
 
-class LLMResponse(BaseModel):
-    """Complete structured response returned from an LLM inference call."""
-    content: Optional[str] = Field(default=None)
-    tool_calls: Optional[List[Dict[str, Any]]] = Field(default=None)
-    finish_reason: Optional[str] = Field(default=None)
-    usage: Optional[Dict[str, int]] = Field(default=None)
-    raw: Optional[Dict[str, Any]] = Field(default=None)
+@dataclass
+class StreamChunk:
+    """Single decoded chunk yielded from LLM stream."""
+    content: Optional[str] = None
+    finish_reason: Optional[str] = None
+    tool_calls: List[DeltaToolCall] = field(default_factory=list)
+
+
+@dataclass
+class LLMResponse:
+    """Consolidated completion response returned from LLM generation."""
+    content: Optional[str] = None
+    finish_reason: Optional[str] = "stop"
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    thought: Optional[str] = None
+    usage: Dict[str, int] = field(default_factory=dict)
+
+
+async def accumulate_stream_chunks(
+    stream: AsyncIterator[StreamChunk],
+) -> Tuple[LLMResponse, List[StreamChunk]]:
+    """Consolidate incremental stream chunks into a unified LLMResponse."""
+    raw_chunks: List[StreamChunk] = []
+    content_parts: List[str] = []
+    finish_reason: Optional[str] = None
+    tool_calls_map: Dict[int, Dict[str, Any]] = {}
+
+    async for chunk in stream:
+        raw_chunks.append(chunk)
+        if chunk.content:
+            content_parts.append(chunk.content)
+        if chunk.finish_reason:
+            finish_reason = chunk.finish_reason
+        for tc in chunk.tool_calls:
+            idx = tc.index
+            if idx not in tool_calls_map:
+                tool_calls_map[idx] = {
+                    "id": tc.id or "",
+                    "type": "function",
+                    "function": {"name": tc.name or "", "arguments": ""},
+                }
+            if tc.id:
+                tool_calls_map[idx]["id"] = tc.id
+            if tc.name:
+                tool_calls_map[idx]["function"]["name"] = tc.name
+            if tc.arguments:
+                tool_calls_map[idx]["function"]["arguments"] += tc.arguments
+
+    final_content = "".join(content_parts) if content_parts else None
+    sorted_calls = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
+
+    return LLMResponse(
+        content=final_content,
+        finish_reason=finish_reason or "stop",
+        tool_calls=sorted_calls,
+    ), raw_chunks
 
 
 class AsyncLLMClient:
-    """
-    High-performance asynchronous client communicating with OpenAI-compatible backends.
-    Supports connection pooling, streaming generation, and structured function calling.
-    """
+    """Asynchronous HTTP client managing LLM API interactions with adaptive fallbacks."""
 
     def __init__(
         self,
         config: Optional[LLMConfig] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
-        self.config = config or LLMConfig()
-        self._transport = transport
+        self.config: LLMConfig = config or LLMConfig()
+        self.transport: Optional[httpx.AsyncBaseTransport] = transport
         self._client: Optional[httpx.AsyncClient] = None
-        self._lock = asyncio.Lock()
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Lazy-initialize and return the shared httpx.AsyncClient session."""
-        async with self._lock:
-            if self._client is None or self._client.is_closed:
-                headers = {"Content-Type": "application/json"}
-                if self.config.api_key:
-                    headers["Authorization"] = f"Bearer {self.config.api_key}"
-                else:
-                    headers["Authorization"] = "Bearer not-needed"
-
-                self._client = httpx.AsyncClient(
-                    base_url=self.config.api_base.rstrip("/"),
-                    headers=headers,
-                    timeout=httpx.Timeout(self.config.timeout, connect=10.0),
-                    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-                    transport=self._transport,
-                )
-            return self._client
+    def _get_client(self) -> httpx.AsyncClient:
+        """Resolve or lazily initialize the underlying httpx.AsyncClient."""
+        if self._client is None or self._client.is_closed:
+            base_url = self.config.base_url or self.config.api_base
+            self._client = httpx.AsyncClient(
+                base_url=str(base_url),
+                transport=self.transport,
+                timeout=self.config.timeout,
+            )
+        return self._client
 
     async def close(self) -> None:
-        """Close the underlying HTTP client session."""
-        async with self._lock:
-            if self._client is not None and not self._client.is_closed:
-                await self._client.aclose()
-                self._client = None
+        """Close the active HTTP client session."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
 
-    async def __aenter__(self) -> AsyncLLMClient:
-        await self._get_client()
-        return self
-
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        await self.close()
-
-    def _prepare_payload(
-        self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        stream: bool = False,
-    ) -> Dict[str, Any]:
-        """Construct the standard OpenAI chat completion JSON payload."""
-        payload: Dict[str, Any] = {
-            "model": self.config.model,
-            "messages": messages,
-            "stream": stream,
-            "temperature": temperature if temperature is not None else self.config.temperature,
-        }
-
-        if max_tokens is not None or self.config.max_tokens is not None:
-            payload["max_tokens"] = max_tokens if max_tokens is not None else self.config.max_tokens
-
-        if self.config.top_p is not None:
-            payload["top_p"] = self.config.top_p
-
-        if tools:
-            payload["tools"] = tools
-            if tool_choice:
-                payload["tool_choice"] = tool_choice
-
-        return payload
+    async def test_connection(self) -> bool:
+        """Probe model discovery endpoint to verify provider connectivity."""
+        client = self._get_client()
+        endpoints = ["/v1/models", "/models", "models"]
+        for ep in endpoints:
+            try:
+                resp = await client.get(ep)
+                if resp.status_code == 200:
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def chat_completion(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        **kwargs: Any,
     ) -> LLMResponse:
-        """
-        Execute a standard non-streaming chat completion request.
-        Includes automatic retry mechanics for transient communication failures.
-        """
-        client = await self._get_client()
-        payload = self._prepare_payload(
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=False,
-        )
+        """Execute a non-streaming chat completion request with adaptive 422 recovery."""
+        client = self._get_client()
+        endpoint = "/v1/chat/completions" if "/v1" not in str(client.base_url) else "/chat/completions"
 
-        last_exception: Optional[Exception] = None
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key and self.config.api_key != "EMPTY":
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+
+        payload: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice or "auto"
+        payload.update(kwargs)
+
+        last_err: Optional[Exception] = None
 
         for attempt in range(1, self.config.max_retries + 1):
             try:
-                response = await client.post("/chat/completions", json=payload)
-                response.raise_for_status()
-                data = response.json()
+                resp = await client.post(endpoint, json=payload, headers=headers)
+                if resp.status_code >= 400:
+                    err_body = resp.text
+                    print(f"[LLM ERROR {resp.status_code}] URL: {resp.url} | Details: {err_body}")
 
-                choice = data.get("choices", [{}])[0]
-                message = choice.get("message", {})
+                    # Adaptive Auto-Healing for 422 Unprocessable Entity
+                    if resp.status_code == 422 and attempt < self.config.max_retries:
+                        if "tool_choice" in payload:
+                            print("[LLM RECOVERY] Removing 'tool_choice' parameter and retrying...")
+                            payload.pop("tool_choice", None)
+                            continue
+                        if "tools" in payload:
+                            print("[LLM RECOVERY] Removing 'tools' parameter and retrying...")
+                            payload.pop("tools", None)
+                            continue
+                        if payload.get("max_tokens", 0) > 4096:
+                            print("[LLM RECOVERY] Clamping 'max_tokens' to 2048 and retrying...")
+                            payload["max_tokens"] = 2048
+                            continue
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                choice = data["choices"][0]
+                msg = choice.get("message", {})
+                content = msg.get("content")
+                finish_reason = choice.get("finish_reason", "stop")
+                tool_calls = msg.get("tool_calls", [])
+                usage = data.get("usage", {})
 
                 return LLMResponse(
-                    content=message.get("content"),
-                    tool_calls=message.get("tool_calls"),
-                    finish_reason=choice.get("finish_reason"),
-                    usage=data.get("usage"),
-                    raw=data,
+                    content=content,
+                    finish_reason=finish_reason,
+                    tool_calls=tool_calls,
+                    usage=usage,
                 )
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as ex:
-                last_exception = ex
-                logger.warning(
-                    "LLM request attempt %d/%d failed: %s",
-                    attempt,
-                    self.config.max_retries,
-                    str(ex),
-                )
-                if attempt < self.config.max_retries:
-                    await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
-                else:
-                    break
+            except Exception as err:
+                last_err = err
+                logger.warning(f"LLM request attempt {attempt}/{self.config.max_retries} failed: {err}")
 
         raise RuntimeError(
-            f"Failed to obtain chat completion after {self.config.max_retries} attempts: {last_exception}"
+            f"Failed to obtain chat completion after {self.config.max_retries} attempts: {last_err}"
         )
 
     async def stream_chat(
@@ -225,137 +224,69 @@ class AsyncLLMClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        """
-        Stream chat completion tokens and tool invocation fragments asynchronously.
-        Yields StreamChunk instances until completion.
-        """
-        client = await self._get_client()
-        payload = self._prepare_payload(
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        )
+        """Stream chat completion chunks asynchronously."""
+        client = self._get_client()
+        endpoint = "/v1/chat/completions" if "/v1" not in str(client.base_url) else "/chat/completions"
 
-        async with client.stream("POST", "/chat/completions", json=payload) as response:
-            response.raise_for_status()
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key and self.config.api_key != "EMPTY":
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
 
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line or not line.startswith("data:"):
+        payload: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice or "auto"
+        payload.update(kwargs)
+
+        async with client.stream("POST", endpoint, json=payload, headers=headers) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data: "):
                     continue
-
-                raw_data = line[5:].strip()
+                raw_data = line[len("data: "):].strip()
                 if raw_data == "[DONE]":
                     break
-
                 try:
-                    data = json.loads(raw_data)
-                except json.JSONDecodeError:
-                    continue
+                    chunk_json = json.loads(raw_data)
+                    choice = chunk_json["choices"][0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content")
+                    finish_reason = choice.get("finish_reason")
+                    tc_deltas: List[DeltaToolCall] = []
 
-                choices = data.get("choices", [])
-                if not choices:
-                    continue
-
-                choice = choices[0]
-                delta = choice.get("delta", {})
-                finish_reason = choice.get("finish_reason")
-
-                content_delta = delta.get("content")
-                tool_calls_delta = delta.get("tool_calls")
-
-                parsed_tool_calls: Optional[List[DeltaToolCall]] = None
-                if tool_calls_delta:
-                    parsed_tool_calls = []
-                    for tc in tool_calls_delta:
-                        parsed_tool_calls.append(
-                            DeltaToolCall(
-                                index=tc.get("index", 0),
-                                id=tc.get("id"),
-                                name=tc.get("function", {}).get("name") if "function" in tc else None,
-                                arguments=tc.get("function", {}).get("arguments") if "function" in tc else None,
+                    if "tool_calls" in delta:
+                        for raw_tc in delta["tool_calls"]:
+                            tc_deltas.append(
+                                DeltaToolCall(
+                                    index=raw_tc.get("index", 0),
+                                    id=raw_tc.get("id"),
+                                    name=raw_tc.get("function", {}).get("name"),
+                                    arguments=raw_tc.get("function", {}).get("arguments", ""),
+                                )
                             )
-                        )
 
-                yield StreamChunk(
-                    content=content_delta,
-                    tool_calls=parsed_tool_calls,
-                    finish_reason=finish_reason,
-                    usage=data.get("usage"),
-                )
-
-    async def test_connection(self) -> bool:
-        """Verify reachability and readiness of the configured LLM endpoint."""
-        try:
-            client = await self._get_client()
-            resp = await client.get("/models")
-            return resp.status_code == 200
-        except Exception as ex:
-            logger.debug("LLM endpoint connectivity check failed: %s", ex)
-            return False
+                    yield StreamChunk(
+                        content=content,
+                        finish_reason=finish_reason,
+                        tool_calls=tc_deltas,
+                    )
+                except Exception:
+                    continue
 
 
-async def accumulate_stream_chunks(
-    stream: AsyncIterator[StreamChunk],
-    model: str = "",
-) -> Tuple[LLMResponse, List[StreamChunk]]:
-    """
-    Consumes a stream of StreamChunk items and reconstructs the consolidated LLMResponse.
-    Returns a tuple of (LLMResponse, List[StreamChunk]).
-    """
-    chunks: List[StreamChunk] = []
-    content_parts: List[str] = []
-    tool_calls_map: Dict[int, Dict[str, Any]] = {}
-    finish_reason: Optional[str] = "stop"
-    usage: Optional[Dict[str, int]] = None
-
-    async for chunk in stream:
-        chunks.append(chunk)
-
-        if chunk.content:
-            content_parts.append(chunk.content)
-
-        if chunk.tool_calls:
-            for delta in chunk.tool_calls:
-                idx = delta.index
-                if idx not in tool_calls_map:
-                    tool_calls_map[idx] = {
-                        "id": delta.id or f"call_{idx}",
-                        "type": "function",
-                        "function": {
-                            "name": delta.name or "",
-                            "arguments": "",
-                        },
-                    }
-                else:
-                    if delta.id:
-                        tool_calls_map[idx]["id"] = delta.id
-                    if delta.name:
-                        tool_calls_map[idx]["function"]["name"] = delta.name
-
-                if delta.arguments:
-                    tool_calls_map[idx]["function"]["arguments"] += delta.arguments
-
-        if chunk.finish_reason:
-            finish_reason = chunk.finish_reason
-
-        if chunk.usage:
-            usage = chunk.usage
-
-    sorted_indices = sorted(tool_calls_map.keys())
-    consolidated_tool_calls = [tool_calls_map[i] for i in sorted_indices] if tool_calls_map else None
-    final_content = "".join(content_parts) if content_parts else None
-
-    response = LLMResponse(
-        content=final_content,
-        tool_calls=consolidated_tool_calls,
-        finish_reason=finish_reason,
-        usage=usage,
-    )
-    return response, chunks
+__all__ = [
+    "LLMConfig",
+    "StreamChunk",
+    "DeltaToolCall",
+    "LLMResponse",
+    "AsyncLLMClient",
+    "accumulate_stream_chunks",
+]
