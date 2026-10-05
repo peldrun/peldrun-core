@@ -1,10 +1,13 @@
 """
 PELDRUN Core Base Tool Architecture.
-Defines abstract tool interfaces, structured invocation results, and automatic JSON Schema generation.
+Defines abstract tool interfaces, structured invocation results, automatic JSON Schema generation,
+and a resilient synchronous-to-asynchronous execution bridge.
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import inspect
 import logging
 from abc import ABC, abstractmethod
@@ -113,8 +116,22 @@ class BaseTool(ABC):
         ...
 
     def _run(self, **kwargs: Any) -> ToolResult:
-        """Internal synchronous fallback. Defaults to raising NotImplementedError."""
-        raise NotImplementedError(f"Synchronous execution not implemented for tool '{self.name}'.")
+        """
+        Resilient synchronous fallback bridging to _arun without raising NotImplementedError.
+        Handles event loop resolution across synchronous threads and async contexts.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # Run in a separate dedicated thread to prevent blocking or event loop conflicts
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(lambda: asyncio.run(self._arun(**kwargs)))
+                return future.result()
+        else:
+            return asyncio.run(self._arun(**kwargs))
 
     async def aexecute(self, **kwargs: Any) -> ToolResult:
         """
