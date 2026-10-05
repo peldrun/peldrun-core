@@ -1,224 +1,310 @@
 """
-PELDRUN Tool Call Agent.
-Inherits from ReActAgent, implements concrete think/act cycles,
-and safeguards against malformed tool generation loops.
+Autonomous Tool Calling Agent for PELDRUN Core Runtime.
+Executes Think-Act cycles with reliable tool dispatching directly on tool instances,
+live event streaming, and OpenManus stop condition parity.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
-import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from peldrun.agents.base import AgentConfig
-from peldrun.agents.react_agent import ReActAgent
+from peldrun.agents.base import AgentConfig, BaseAgent
 from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType, PeldrunEvent
-from peldrun.llm.client import AsyncLLMClient
-from peldrun.tools.base import ToolResult
+from peldrun.llm.client import AsyncLLMClient, LLMResponse, ToolCall
 from peldrun.tools.collection import ToolCollection
 
-logger = logging.getLogger(__name__)
 
-
-class ToolCallAgent(ReActAgent):
-    """Autonomous agent executing actions through structured LLM tool calling."""
+class ToolCallAgent(BaseAgent):
+    """
+    Autonomous ReAct agent executing real tool invocations on concrete tool instances.
+    """
 
     def __init__(
         self,
-        config: AgentConfig,
-        llm: Optional[AsyncLLMClient] = None,
-        tool_collection: Optional[ToolCollection] = None,
+        config: Optional[AgentConfig] = None,
+        llm: Optional[Any] = None,
+        tool_collection: Optional[Any] = None,
         emitter: Optional[EventEmitter] = None,
         workspace_dir: Optional[str] = None,
+        tool_registry: Optional[Any] = None,
+        **kwargs: Any
     ) -> None:
-        super().__init__(
-            config=config,
-            llm=llm,
-            tool_collection=tool_collection,
-            emitter=emitter,
-            workspace_dir=workspace_dir,
-        )
-        self._consecutive_empty_calls: int = 0
+        active_tools = tool_collection or tool_registry or ToolCollection()
+
+        base_params = inspect.signature(BaseAgent.__init__).parameters
+        base_kwargs: Dict[str, Any] = {}
+
+        if "config" in base_params:
+            base_kwargs["config"] = config
+        if "tool_registry" in base_params:
+            base_kwargs["tool_registry"] = active_tools
+        elif "tools" in base_params:
+            base_kwargs["tools"] = active_tools
+
+        if "emitter" in base_params and emitter is not None:
+            base_kwargs["emitter"] = emitter
+        elif "event_emitter" in base_params and emitter is not None:
+            base_kwargs["event_emitter"] = emitter
+
+        if "workspace_dir" in base_params and workspace_dir is not None:
+            base_kwargs["workspace_dir"] = workspace_dir
+
+        for k, v in kwargs.items():
+            if k in base_params and k not in base_kwargs and k != "llm":
+                base_kwargs[k] = v
+
+        super().__init__(**base_kwargs)
+
+        self.llm = llm
+        self.tool_collection = active_tools
+        self.tools = active_tools
+        self.emitter = emitter or getattr(self, "emitter", None) or EventEmitter()
+        self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir else Path.cwd()
+        self.system_prompt = getattr(config, "system_prompt", "You are an autonomous specialist agent.")
+        self.messages: List[Dict[str, Any]] = []
+        self.current_step = 1
         self._final_answer: str = ""
 
-    def _format_tools_for_llm(self) -> List[Dict[str, Any]]:
-        """Return standardized OpenAI function schemas for available tools."""
-        tools_list: List[Dict[str, Any]] = []
-        for name, tool in self.tool_collection.tools.items():
-            parameters = getattr(tool, "parameters", {})
-            if not parameters:
-                parameters = {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                }
-            tools_list.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": getattr(tool, "description", "") or f"Tool {name}",
-                        "parameters": parameters,
-                    },
-                }
-            )
-        return tools_list
+    def set_system_prompt(self, prompt: str) -> None:
+        self.system_prompt = prompt
 
-    async def think(self) -> Optional[Any]:
-        """Request model completion with available tool specifications."""
-        tool_schemas = self._format_tools_for_llm()
+    async def _emit(self, event_type: EventType, step: int, payload: Dict[str, Any]) -> None:
+        """Dispatches typed events to registered listeners."""
+        if not self.emitter:
+            return
         try:
-            response = await self.llm.chat_complete(
-                messages=self.messages,
-                tools=tool_schemas if tool_schemas else None,
-                temperature=0.2,
-            )
-        except Exception as err:
-            error_msg = f"LLM Inference Failure: {str(err)}"
-            logger.error(error_msg)
-            await self.emitter.emit(
-                PeldrunEvent(
-                    type=EventType.ERROR,
-                    step=self.current_step,
-                    payload={"error": error_msg},
-                )
-            )
-            self._final_answer = error_msg
-            return None
-
-        content = getattr(response, "content", "") or ""
-        reasoning = getattr(response, "reasoning_content", "") or ""
-        raw_tool_calls = getattr(response, "tool_calls", None) or []
-
-        thought_text = reasoning.strip() or content.strip()
-        if thought_text:
-            await self.emitter.emit(
-                PeldrunEvent(
-                    type=EventType.THOUGHT,
-                    step=self.current_step,
-                    payload={"thought": thought_text},
-                )
-            )
-
-        if not raw_tool_calls:
-            self._final_answer = content or thought_text or "Task completed."
-            self.messages.append({"role": "assistant", "content": self._final_answer})
-            return None
-
-        return {"response": response, "tool_call": raw_tool_calls[0]}
-
-    async def act(self, decision: Any) -> bool:
-        """Safely execute the tool call and register observation into context."""
-        response = decision.get("response")
-        selected_call = decision.get("tool_call")
-
-        call_func = getattr(selected_call, "function", selected_call)
-        tool_name = getattr(call_func, "name", "")
-        raw_arguments = getattr(call_func, "arguments", "{}")
-
-        parsed_args: Dict[str, Any] = {}
-        if isinstance(raw_arguments, dict):
-            parsed_args = raw_arguments
-        elif isinstance(raw_arguments, str) and raw_arguments.strip():
+            event_obj = PeldrunEvent(type=event_type, step=step, payload=payload)
+            res = self.emitter.emit(event_obj)
+            if inspect.isawaitable(res):
+                await res
+        except Exception:
             try:
-                parsed_args = json.loads(raw_arguments)
+                res = self.emitter.emit(event_type, step=step, payload=payload)
+                if inspect.isawaitable(res):
+                    await res
             except Exception:
-                parsed_args = {}
+                pass
 
-        if not parsed_args and tool_name not in ["terminate", "ask_human"]:
-            self._consecutive_empty_calls += 1
-            if self._consecutive_empty_calls >= 3:
-                recovery_msg = (
-                    f"Error: Tool '{tool_name}' was invoked repeatedly with empty arguments. "
-                    "You must provide required parameters or call 'terminate' with the final answer."
-                )
-                self.messages.append({"role": "system", "content": recovery_msg})
-                return True
-        else:
-            self._consecutive_empty_calls = 0
+    def _get_tools_schema(self) -> List[Dict[str, Any]]:
+        tools_obj = getattr(self, "tool_collection", None) or getattr(self, "tools", None)
+        if tools_obj is None:
+            return []
 
-        await self.emitter.emit(
-            PeldrunEvent(
-                type=EventType.TOOL_CALL,
-                step=self.current_step,
-                payload={"tool_name": tool_name, "arguments": parsed_args},
-            )
-        )
-
-        if tool_name == "terminate":
-            status = parsed_args.get("status", "success")
-            message = parsed_args.get("message", "") or "Task concluded."
-            self._final_answer = message
-            await self.emitter.emit(
-                PeldrunEvent(
-                    type=EventType.OBSERVATION,
-                    step=self.current_step,
-                    payload={"output": f"Terminated with status: {status}. {message}"},
-                )
-            )
-            return False
-
-        tool_instance = self.tool_collection.get_tool(tool_name)
-        if not tool_instance:
-            obs_text = f"Tool Execution Error: Tool '{tool_name}' is not registered."
-        else:
-            try:
-                result: ToolResult = await tool_instance.arun(**parsed_args)
-                obs_text = result.output if hasattr(result, "output") else str(result)
-            except Exception as ex:
-                obs_text = f"Tool Execution Error ({tool_name}): {str(ex)}"
-
-        await self.emitter.emit(
-            PeldrunEvent(
-                type=EventType.OBSERVATION,
-                step=self.current_step,
-                payload={"output": obs_text},
-            )
-        )
-
-        call_id = getattr(selected_call, "id", f"call_{self.current_step}")
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": getattr(response, "content", "") or "",
-                "tool_calls": [
-                    {
-                        "id": call_id,
+        if hasattr(tools_obj, "to_openai_schemas"):
+            return tools_obj.to_openai_schemas()
+        elif hasattr(tools_obj, "to_params"):
+            return tools_obj.to_params()
+        elif hasattr(tools_obj, "tools") and isinstance(tools_obj.tools, dict):
+            schemas: List[Dict[str, Any]] = []
+            for t in tools_obj.tools.values():
+                if hasattr(t, "to_param"):
+                    schemas.append(t.to_param())
+                elif hasattr(t, "parameters"):
+                    schemas.append({
                         "type": "function",
                         "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(parsed_args, ensure_ascii=False),
-                        },
-                    }
-                ],
-            }
-        )
-        self.messages.append(
-            {
+                            "name": getattr(t, "name", str(t)),
+                            "description": getattr(t, "description", ""),
+                            "parameters": getattr(t, "parameters", {})
+                        }
+                    })
+            return schemas
+        return []
+
+    def _resolve_tool_instance(self, tool_name: str) -> Optional[Any]:
+        """Locates the concrete tool instance from registry, collection, or map."""
+        tools_obj = getattr(self, "tool_collection", None) or getattr(self, "tools", None)
+        if not tools_obj:
+            return None
+
+        # 1. OpenManus get_tool method
+        if hasattr(tools_obj, "get_tool"):
+            t = tools_obj.get_tool(tool_name)
+            if t:
+                return t
+
+        # 2. Registry or dict get method
+        if hasattr(tools_obj, "get"):
+            try:
+                t = tools_obj.get(tool_name)
+                if t:
+                    return t
+            except Exception:
+                pass
+
+        # 3. OpenManus tool_map dictionary
+        if hasattr(tools_obj, "tool_map") and isinstance(tools_obj.tool_map, dict):
+            if tool_name in tools_obj.tool_map:
+                return tools_obj.tool_map[tool_name]
+
+        # 4. Collection tools dictionary
+        if hasattr(tools_obj, "tools") and isinstance(tools_obj.tools, dict):
+            if tool_name in tools_obj.tools:
+                return tools_obj.tools[tool_name]
+
+        # 5. Collection tools list
+        if hasattr(tools_obj, "tools") and isinstance(tools_obj.tools, (list, tuple)):
+            for t in tools_obj.tools:
+                if getattr(t, "name", None) == tool_name:
+                    return t
+
+        return None
+
+    async def think(self, step: int) -> LLMResponse:
+        tools_schema = self._get_tools_schema()
+
+        if hasattr(self.llm, "generate"):
+            response = await self.llm.generate(
+                messages=self.messages,
+                tools=tools_schema if tools_schema else None,
+                tool_choice="auto",
+                temperature=0.2
+            )
+        elif hasattr(self.llm, "chat_completion"):
+            response = await self.llm.chat_completion(
+                messages=self.messages,
+                tools=tools_schema if tools_schema else None,
+                tool_choice="auto",
+                temperature=0.2
+            )
+        elif hasattr(self.llm, "chat_complete"):
+            response = await self.llm.chat_complete(
+                messages=self.messages,
+                tools=tools_schema if tools_schema else None,
+                temperature=0.2
+            )
+        else:
+            raise AttributeError("LLM client does not provide generate or chat_completion interface.")
+
+        thought_val = response.reasoning or response.thought or response.content or ""
+        if thought_val:
+            print(f"[CORE LIVE STREAM] Thought: {thought_val[:90]}...")
+            await self._emit(EventType.THOUGHT, step=step, payload={"thought": thought_val})
+
+        return response
+
+    async def act(self, step: int, tool_calls: List[ToolCall]) -> List[str]:
+        observations: List[str] = []
+
+        for call in tool_calls:
+            tool_name = call.name
+            args = call.arguments if isinstance(call.arguments, dict) else {}
+            if isinstance(call.arguments, str):
+                try:
+                    args = json.loads(call.arguments)
+                except Exception:
+                    args = {"raw": call.arguments}
+
+            print(f"[CORE LIVE STREAM] Tool Call: {tool_name}({json.dumps(args, ensure_ascii=False)[:80]})")
+            await self._emit(EventType.TOOL_CALL, step=step, payload={"tool_name": tool_name, "arguments": args})
+
+            output_str = ""
+            tool_inst = self._resolve_tool_instance(tool_name)
+
+            if tool_inst and hasattr(tool_inst, "execute"):
+                try:
+                    fn = tool_inst.execute
+                    if inspect.iscoroutinefunction(fn):
+                        res = await fn(**args)
+                    else:
+                        res = fn(**args)
+                        if inspect.isawaitable(res):
+                            res = await res
+                    output_str = str(res)
+                except Exception as ex:
+                    output_str = f"Error executing tool '{tool_name}': {str(ex)}"
+            else:
+                output_str = f"Error: Tool '{tool_name}' not found in active collection."
+
+            print(f"[CORE LIVE STREAM] Observation: {output_str[:90]}...")
+            await self._emit(EventType.OBSERVATION, step=step, payload={"tool_name": tool_name, "output": output_str})
+
+            # Record tool result into history (Strict OpenManus conversation protocol)
+            self.messages.append({
                 "role": "tool",
-                "tool_call_id": call_id,
+                "tool_call_id": call.id,
                 "name": tool_name,
-                "content": obs_text,
-            }
-        )
+                "content": output_str
+            })
+            observations.append(output_str)
+
+        return observations
+
+    async def _astep(self) -> bool:
+        step = self.current_step
+
+        if hasattr(self, "state") and self.state is not None:
+            if hasattr(self.state, "step"):
+                self.state.step = step
+            if hasattr(self.state, "current_step"):
+                self.state.current_step = step
+            if hasattr(self.state, "messages"):
+                self.state.messages = self.messages
+
+        response = await self.think(step=step)
+
+        # Stop condition: When model proposes no tool calls, the task is finished
+        if not response.tool_calls:
+            self._final_answer = response.content or response.thought or response.reasoning or "Task completed."
+            return False
+
+        # Record assistant tool calls in conversation history
+        self.messages.append({
+            "role": "assistant",
+            "content": response.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments)
+                    }
+                }
+                for tc in response.tool_calls
+            ]
+        })
+
+        observations = await self.act(step=step, tool_calls=response.tool_calls)
+
+        # Stop condition: Terminate tool invoked
+        has_terminated = any(tc.name.lower() in ("terminate", "done") for tc in response.tool_calls)
+        if has_terminated:
+            self._final_answer = response.content or (observations[-1] if observations else "Task completed via termination tool.")
+            return False
+
         return True
 
-    async def run_task(self, prompt: str, max_steps: Optional[int] = None) -> str:
-        """Direct driver method executing the iterative loop."""
-        steps_limit = max_steps or self.config.max_steps or 30
-        self.config.max_steps = steps_limit
-        self.current_step = 0
+    async def run_task(self, prompt: str, max_steps: int = 30) -> str:
         self.messages = [
-            {"role": "system", "content": self.config.system_prompt},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": prompt}
         ]
-        self._consecutive_empty_calls = 0
         self._final_answer = ""
 
-        while self.current_step < steps_limit:
+        for step in range(1, max_steps + 1):
+            self.current_step = step
+            print(f"[CORE LIVE STREAM] Step {step} Started...")
+            await self._emit(EventType.STEP_START, step=step, payload={"step": step})
+
             should_continue = await self._astep()
+
+            await self._emit(
+                EventType.STEP_END,
+                step=step,
+                payload={"step": step, "status": "completed" if not should_continue else "progress"}
+            )
+
             if not should_continue:
                 break
 
-        return self._final_answer
+        return self._final_answer or "Task execution finished."
+
+    async def arun(self, task: str = "", max_steps: Optional[int] = None, **kwargs: Any) -> Any:
+        prompt_val = task or kwargs.get("prompt", "")
+        limit_val = max_steps or getattr(self.config, "max_steps", 30)
+        return await self.run_task(prompt=prompt_val, max_steps=limit_val)

@@ -1,6 +1,6 @@
 """
-PELDRUN Core LLM Subsystem.
-Exports unified client primitives, token counting utilities, provider adapters, and dynamic provider factory.
+PELDRUN Core LLM Module.
+Exports universal client contracts, configuration models, and response structures.
 """
 
 from peldrun.llm.client import (
@@ -9,39 +9,19 @@ from peldrun.llm.client import (
     LLMConfig,
     LLMResponse,
     StreamChunk,
-    accumulate_stream_chunks,
+    ToolCall,
+    sanitize_tools_for_openai,
 )
-from peldrun.llm.providers import (
-    BaseLLMProvider,
-    LMStudioProvider,
-    OllamaProvider,
-    OpenAICompatProvider,
-    get_provider,
-)
-from peldrun.llm.tokenizer import (
-    ContextBudgetManager,
-    count_message_tokens,
-    estimate_tokens_from_string,
-    truncate_messages_sliding_window,
-)
+from peldrun.llm.providers.openai_compat import BaseLLMProvider, OpenAICompatProvider
 
 __all__ = [
-    # Client primitives
     "AsyncLLMClient",
+    "BaseLLMProvider",
+    "DeltaToolCall",
     "LLMConfig",
     "LLMResponse",
-    "StreamChunk",
-    "DeltaToolCall",
-    "accumulate_stream_chunks",
-    # Tokenizer & context budgeting
-    "ContextBudgetManager",
-    "count_message_tokens",
-    "estimate_tokens_from_string",
-    "truncate_messages_sliding_window",
-    # Providers & factory
-    "BaseLLMProvider",
     "OpenAICompatProvider",
-    "LMStudioProvider",
-    "OllamaProvider",
-    "get_provider",
+    "StreamChunk",
+    "ToolCall",
+    "sanitize_tools_for_openai",
 ]
