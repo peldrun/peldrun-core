@@ -52,8 +52,9 @@ class ToolResult(BaseModel):
 
 class BaseTool(ABC):
     """
-    Abstract base class for all tools executable within PELDRUN agents.
+    Abstract base class for all native tools executable within PELDRUN agents.
     Provides schema reflection, parameter validation, and workspace scoping.
+    Satisfies the ToolRuntime Protocol.
     """
 
     name: str = ""
@@ -66,6 +67,10 @@ class BaseTool(ABC):
     def set_workspace(self, workspace_root: str) -> None:
         """Configure or update the bounded workspace root for this tool instance."""
         self.workspace_root = workspace_root
+
+    def set_workspace_root(self, workspace_root: str) -> None:
+        """Alias for set_workspace ensuring naming uniformity across runtime modules."""
+        self.set_workspace(workspace_root)
 
     def to_openai_schema(self) -> Dict[str, Any]:
         """

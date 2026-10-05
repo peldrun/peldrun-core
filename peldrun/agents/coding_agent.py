@@ -103,25 +103,31 @@ class CodingAgent(BaseAgent):
             messages=budgeted_messages,
             tools=tool_schemas if tool_schemas else None,
         ):
-            if chunk.content:
-                content_buffer += chunk.content
+            chunk_content = getattr(chunk, "content", None) or getattr(chunk, "content_delta", None)
+            if chunk_content:
+                content_buffer += chunk_content
 
-            if chunk.tool_calls:
-                for dtc in chunk.tool_calls:
-                    idx = dtc.index
+            chunk_tool_calls = getattr(chunk, "tool_calls", None) or getattr(chunk, "tool_call_deltas", None)
+            if chunk_tool_calls:
+                for dtc in chunk_tool_calls:
+                    idx = getattr(dtc, "index", 0)
+                    dtc_id = getattr(dtc, "id", None)
+                    dtc_name = getattr(dtc, "name", None)
+                    dtc_args = getattr(dtc, "arguments", None)
+
                     if idx not in tool_calls_accumulator:
                         tool_calls_accumulator[idx] = {
-                            "id": dtc.id or f"code_call_{idx}",
-                            "name": dtc.name or "",
-                            "arguments": dtc.arguments or "",
+                            "id": dtc_id or f"code_call_{idx}",
+                            "name": dtc_name or "",
+                            "arguments": dtc_args or "",
                         }
                     else:
-                        if dtc.id:
-                            tool_calls_accumulator[idx]["id"] = dtc.id
-                        if dtc.name:
-                            tool_calls_accumulator[idx]["name"] += dtc.name
-                        if dtc.arguments:
-                            tool_calls_accumulator[idx]["arguments"] += dtc.arguments
+                        if dtc_id:
+                            tool_calls_accumulator[idx]["id"] = dtc_id
+                        if dtc_name:
+                            tool_calls_accumulator[idx]["name"] += dtc_name
+                        if dtc_args:
+                            tool_calls_accumulator[idx]["arguments"] += dtc_args
 
         # 2. Extract and broadcast reasoning
         thought, clean_content = self._extract_reasoning_and_content(content_buffer)

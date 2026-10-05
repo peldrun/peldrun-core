@@ -7,11 +7,13 @@ Compatible with CLI, Web API, and Event bus registries.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 import uuid
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
+from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.tools.base import BaseTool, ToolResult
 
 
@@ -50,21 +52,18 @@ class HumanInputRegistry:
 
 
 class HumanInputArgs(BaseModel):
-    """
-    Pydantic schema defining arguments for HumanInputTool / ask_human.
-    Supports flexible aliases (prompt/query/question) and rich question types.
-    """
+    """Pydantic schema defining arguments for HumanInputTool / ask_human."""
     prompt: str = Field(
         ...,
         description="The question or clarification needed from the human operator."
     )
     input_type: str = Field(
         default="text",
-        description="Interaction modality: 'text' (input field), 'confirm' (Yes/No), 'select' (single choice), or 'multiple_choice'."
+        description="Interaction modality: 'text', 'confirm', 'select', or 'multiple_choice'."
     )
     options: List[str] = Field(
         default_factory=list,
-        description="List of choices/buttons for the operator to select from (e.g. ['Yes', 'No'] or custom options)."
+        description="List of choices/buttons for the operator to select from."
     )
     timeout_seconds: Optional[int] = Field(
         default=600,
@@ -75,14 +74,11 @@ class HumanInputArgs(BaseModel):
     @classmethod
     def reconcile_prompt_aliases(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            # Resolve interchangeable keys: prompt, query, question
             if "prompt" not in data or not data["prompt"]:
                 for alias in ("query", "question", "text", "message"):
                     if alias in data and data[alias]:
                         data["prompt"] = str(data[alias])
                         break
-            
-            # Default options for confirm type
             itype = str(data.get("input_type", "text")).lower()
             if itype in ("confirm", "boolean") and not data.get("options"):
                 data["options"] = ["Yes", "No"]
@@ -96,7 +92,6 @@ HumanInputParameters = HumanInputArgs
 class HumanInputTool(BaseTool):
     """
     Tool that suspends agent execution until a response is received from the human user.
-    Supports interactive questions, input forms, and single/multiple button choices.
     """
 
     name: str = "ask_human"
@@ -116,6 +111,16 @@ class HumanInputTool(BaseTool):
         self.workspace_root = workspace_root
         self.emitter = emitter
 
+    @classmethod
+    def get_pending_requests(cls) -> Dict[str, Any]:
+        """Class method returning all pending human inquiry payloads for test inspection."""
+        return dict(HumanInputRegistry._request_payloads)
+
+    @classmethod
+    def submit_human_response(cls, request_id: str, response: str) -> bool:
+        """Class method to unblock and resolve a pending request."""
+        return HumanInputRegistry.resolve_request(request_id, response)
+
     async def _arun(
         self,
         prompt: str,
@@ -124,9 +129,6 @@ class HumanInputTool(BaseTool):
         timeout_seconds: Optional[int] = 600,
         **kwargs: Any,
     ) -> ToolResult:
-        """
-        Asynchronously suspend execution, emit request event, and wait for human resolution.
-        """
         request_id = str(uuid.uuid4())
         timeout_val = float(timeout_seconds) if timeout_seconds else 600.0
         opts = options or []
@@ -134,26 +136,33 @@ class HumanInputTool(BaseTool):
         payload = {
             "request_id": request_id,
             "prompt": prompt,
+            "question": prompt,
             "input_type": input_type,
             "options": opts,
             "timeout_seconds": timeout_val,
         }
 
-        # 1. Register future in central registry
         future = HumanInputRegistry.register_request(request_id, payload)
 
-        # 2. Emit human input event to SSE/WebSocket stream if emitter available
         if self.emitter is not None:
             try:
-                if hasattr(self.emitter, "emit_event"):
-                    await self.emitter.emit_event(
-                        event_type="human_input_required",
-                        data=payload
-                    )
-            except Exception as emit_err:
-                pass
+                event_obj = PeldrunEvent(
+                    type=EventType.ASK_HUMAN,
+                    step=1,
+                    payload=payload,
+                )
+                res = self.emitter.emit(event_obj)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                try:
+                    res = self.emitter.emit(EventType.ASK_HUMAN.value, data=payload)
+                    if inspect.isawaitable(res):
+                        await res
+                except Exception:
+                    pass
 
-        # 3. Interactive CLI Fallback if running directly in a terminal
+        # Interactive CLI Fallback if run from a terminal
         if sys.stdin and sys.stdin.isatty():
             try:
                 print(f"\n[HUMAN INPUT REQUIRED] {prompt}")
@@ -170,11 +179,10 @@ class HumanInputTool(BaseTool):
             except Exception:
                 pass
 
-        # 4. Await user resolution from Web UI or CLI
         try:
             response = await asyncio.wait_for(future, timeout=timeout_val)
             return ToolResult(
-                output=f"Human Response: {response}",
+                output=response,
                 exit_code=0,
                 is_error=False,
                 metadata={
@@ -187,7 +195,7 @@ class HumanInputTool(BaseTool):
         except asyncio.TimeoutError:
             HumanInputRegistry.cancel_request(request_id)
             return ToolResult(
-                output=f"Human response timed out after {timeout_val} seconds. Proceeding with default action.",
+                output=f"Human response timed out after {timeout_val} seconds.",
                 exit_code=1,
                 is_error=True,
                 metadata={"request_id": request_id, "timeout": True},
@@ -195,25 +203,6 @@ class HumanInputTool(BaseTool):
         except asyncio.CancelledError:
             HumanInputRegistry.cancel_request(request_id)
             raise
-
-    def _run(
-        self,
-        prompt: str,
-        input_type: str = "text",
-        options: Optional[List[str]] = None,
-        timeout_seconds: Optional[int] = 600,
-        **kwargs: Any
-    ) -> ToolResult:
-        """
-        Synchronous fallback bridging to _arun cleanly without NotImplementedError.
-        """
-        return super()._run(
-            prompt=prompt,
-            input_type=input_type,
-            options=options,
-            timeout_seconds=timeout_seconds,
-            **kwargs
-        )
 
 
 __all__ = [
